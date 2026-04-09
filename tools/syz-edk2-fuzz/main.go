@@ -90,6 +90,7 @@ var (
 	flagVerbose     = flag.Bool("v", false, "verbose: print every poke")
 	flagOnlyNop     = flag.Bool("only-nop", false, "generate only nop programs (debug)")
 	flagCallSet     = flag.String("call-set", "all", "comma-separated subset of: nop,mem,var,proto,hii,asan,all")
+	flagSnapshot    = flag.Int("snapshot-every", 0, "if >0, cold-restart QEMU every N programs to give the agent a fresh VM (poor-man's snapshot fuzzing)")
 )
 
 type stats struct {
@@ -185,13 +186,32 @@ func main() {
 	rng := rand.New(rand.NewSource(*flagSeed))
 	pcSet := make(map[uint64]struct{})
 
+	progsThisVM := uint64(0)
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
 		default:
 		}
+		// Cold-restart for state isolation if -snapshot-every is set.
+		if *flagSnapshot > 0 && progsThisVM >= uint64(*flagSnapshot) {
+			_ = qemu.Process.Kill()
+			_, _ = qemu.Process.Wait()
+			// Re-zero the doorbell + cover ring + recopy vars.
+			for i := range shmem.Data[edk2OffHostSeq : edk2OffHostSeq+12] {
+				shmem.Data[int(edk2OffHostSeq)+i] = 0
+			}
+			writeU32(shmem.Data, edk2OffCoverCount, 0)
+			_ = copyFile(*flagOvmfVars, varsCopy)
+			qemu = launchQemu(ctx, varsCopy)
+			if err := waitForAgent(shmem.Data); err != nil {
+				st.Timeouts.Add(1)
+				break
+			}
+			progsThisVM = 0
+		}
 		prog := generateProgram(rng)
 		st.Programs.Add(1)
+		progsThisVM++
 		st.Calls.Add(uint64(prog.NumCalls))
 		// Reset cover ring on each iteration so we get a per-program count.
 		writeU32(shmem.Data, edk2OffCoverCount, 0)

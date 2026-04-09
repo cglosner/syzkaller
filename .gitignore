@@ -15,6 +15,9 @@ dashboard/app/config_prod.go
 # tools/syz-edk2-test/run.sh scratch directory
 .syz-edk2-test/
 
+# tools/syz-edk2-fuzz/run-fuzz.sh scratch directory
+.syz-edk2-fuzz/
+
 # coverage report created by make presubmit/test
 .coverage.txt
 

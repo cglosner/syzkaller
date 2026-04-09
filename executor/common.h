@@ -492,6 +492,8 @@ static uint16 csum_inet_digest(struct csum_inet* csum)
 #include "common_test.h"
 #elif GOOS_windows
 #include "common_windows.h"
+#elif GOOS_edk2
+#include "common_edk2.h"
 #else
 #error "unknown OS"
 #endif

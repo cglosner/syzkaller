@@ -98,6 +98,11 @@ ifeq ("$(TARGETOS)", "trusty")
 	TARGETGOARCH := $(HOSTARCH)
 endif
 
+ifeq ("$(TARGETOS)", "edk2")
+	TARGETGOOS := $(HOSTOS)
+	TARGETGOARCH := $(HOSTARCH)
+endif
+
 .PHONY: all clean host target \
 	manager executor kfuzztest ci hub agent \
 	execprog mutate prog2c trace2syz repro upgrade db \

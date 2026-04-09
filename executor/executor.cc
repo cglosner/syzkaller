@@ -520,6 +520,8 @@ static void mmap_input();
 #include "executor_windows.h"
 #elif GOOS_test
 #include "executor_test.h"
+#elif GOOS_edk2
+#include "executor_edk2.h"
 #else
 #error "unknown OS"
 #endif

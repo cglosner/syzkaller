@@ -35,6 +35,11 @@ SKIP_BUILD="${SKIP_BUILD:-0}"
 USE_SYZ_ENV="${USE_SYZ_ENV:-1}"
 SNAPSHOT_EVERY="${SNAPSHOT_EVERY:-0}"
 CALL_SET="${CALL_SET:-all}"
+USE_GRAMMAR="${USE_GRAMMAR:-1}"
+# Default grammar-skip excludes the HII variants because the agent
+# forwards raw fuzzer bytes to Hii->NewPackageList, which wedges on
+# malformed package headers. Override with GRAMMAR_SKIP="" to enable.
+GRAMMAR_SKIP="${GRAMMAR_SKIP:-400,401}"
 
 mkdir -p "${WORKDIR}"
 
@@ -117,6 +122,13 @@ SUMMARY="${WORKDIR}/summary.json"
 run_fuzz() {
     local qemu_bin="$1"
     rm -f "${SHMEM}" "${DEBUG_LOG}"
+    local extra=()
+    if [[ "${USE_GRAMMAR}" == "1" ]]; then
+        extra+=(-use-grammar)
+        if [[ -n "${GRAMMAR_SKIP}" ]]; then
+            extra+=(-grammar-skip "${GRAMMAR_SKIP}")
+        fi
+    fi
     "${SYZ_ROOT}/bin/syz-edk2-fuzz" \
         -ovmf-code "${OVMF_FV}/OVMF_CODE.fd" \
         -ovmf-vars "${OVMF_FV}/OVMF_VARS.fd" \
@@ -128,6 +140,7 @@ run_fuzz() {
         -seed "${SEED}" \
         -snapshot-every "${SNAPSHOT_EVERY}" \
         -call-set "${CALL_SET}" \
+        "${extra[@]}" \
         > "${SUMMARY}" 2> "${WORKDIR}/fuzz-stderr.log"
 }
 

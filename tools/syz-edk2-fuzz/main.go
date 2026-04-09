@@ -38,6 +38,8 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -91,6 +93,9 @@ var (
 	flagOnlyNop     = flag.Bool("only-nop", false, "generate only nop programs (debug)")
 	flagCallSet     = flag.String("call-set", "all", "comma-separated subset of: nop,mem,var,proto,hii,asan,all")
 	flagSnapshot    = flag.Int("snapshot-every", 0, "if >0, cold-restart QEMU every N programs to give the agent a fresh VM (poor-man's snapshot fuzzing)")
+	flagUseGrammar  = flag.Bool("use-grammar", false, "use the syzkaller prog package + sys/edk2 syzlang descriptions to generate programs (real grammar) instead of the hand-rolled random emitter")
+	flagDumpFirst   = flag.Bool("dump-first", false, "dump the first generated program to stderr (debug)")
+	flagGrammarSkip = flag.String("grammar-skip", "", "comma-separated list of API ids to drop from grammar-generated programs (debug)")
 )
 
 type stats struct {
@@ -186,6 +191,26 @@ func main() {
 	rng := rand.New(rand.NewSource(*flagSeed))
 	pcSet := make(map[uint64]struct{})
 
+	var gt *grammarTarget
+	if *flagUseGrammar {
+		var gerr error
+		gt, gerr = getGrammarTarget()
+		if gerr != nil {
+			fail("grammar init: %v", gerr)
+		}
+		fmt.Fprintf(os.Stderr, "[grammar] prog.Target ready: %d syscalls in sys/edk2\n",
+			len(gt.target.Syscalls))
+		if *flagGrammarSkip != "" {
+			grammarSkipIDs = map[uint32]bool{}
+			for _, s := range strings.Split(*flagGrammarSkip, ",") {
+				if v, err := strconv.ParseUint(strings.TrimSpace(s), 10, 32); err == nil {
+					grammarSkipIDs[uint32(v)] = true
+				}
+			}
+			fmt.Fprintf(os.Stderr, "[grammar] skipping ids %v\n", grammarSkipIDs)
+		}
+	}
+
 	progsThisVM := uint64(0)
 	for time.Now().Before(deadline) {
 		select {
@@ -209,7 +234,34 @@ func main() {
 			}
 			progsThisVM = 0
 		}
-		prog := generateProgram(rng)
+		var prog *program
+		if gt != nil {
+			gp, gerr := gt.generateGrammarProgram(rng)
+			if gerr != nil || gp == nil {
+				// Fall back to hand-rolled random for this iteration
+				// so a single bad sample doesn't kill the campaign.
+				prog = generateProgram(rng)
+			} else {
+				prog = gp
+			}
+		} else {
+			prog = generateProgram(rng)
+		}
+		if *flagDumpFirst && st.Programs.Load() == 0 {
+			fmt.Fprintf(os.Stderr, "[dump] first program ncalls=%d wirelen=%d\n",
+				prog.NumCalls, len(prog.Wire))
+			off := 0
+			for i := 0; i < prog.NumCalls && off+8 <= len(prog.Wire); i++ {
+				cid := binary.LittleEndian.Uint32(prog.Wire[off:])
+				csz := binary.LittleEndian.Uint32(prog.Wire[off+4:])
+				fmt.Fprintf(os.Stderr, "[dump]   call %d: id=%d size=%d\n", i, cid, csz)
+				if csz < 8 || off+int(csz) > len(prog.Wire) {
+					fmt.Fprintf(os.Stderr, "[dump]   MALFORMED — bailing\n")
+					break
+				}
+				off += int(csz)
+			}
+		}
 		st.Programs.Add(1)
 		progsThisVM++
 		st.Calls.Add(uint64(prog.NumCalls))

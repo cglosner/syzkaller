@@ -1,0 +1,5 @@
+TITLE: edk2: SyzAgent panic: program magic mismatch (got ADDR want ADDR)
+
+[SYZ-AGENT] starting dispatch loop
+[SYZ-AGENT] panic: program magic mismatch (got 0x41414141 want 0x53595a45)
+[SYZ-AGENT] aborting and resetting VM

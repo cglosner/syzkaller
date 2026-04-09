@@ -1,0 +1,4 @@
+TITLE: edk2: ASSERT in VariableDxe (MdeModulePkg/Universal/Variable/RuntimeDxe/Variable.c:LINE): NameSize > NUM
+
+VariableServiceSetVariable: enter
+ASSERT [VariableDxe] MdeModulePkg/Universal/Variable/RuntimeDxe/Variable.c:4242 NameSize > 0

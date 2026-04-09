@@ -1,0 +1,11 @@
+TITLE: edk2: ASan: heap-buffer-overflow
+
+[SYZ-AGENT] dispatching call 100 (SetVariable)
+==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x000000007fab1234 at pc 0x00000000ffceabcd
+WRITE of size 16 at 0x000000007fab1234 thread T0
+    #0 0xffceabcd in CopyMem MdePkg/Library/BaseMemoryLib/CopyMem.c:42
+    #1 0xffcd1234 in VariableServiceSetVariable MdeModulePkg/Universal/Variable/RuntimeDxe/Variable.c:4242
+0x000000007fab1234 is located 4 bytes to the right of 16-byte region [0x000000007fab1220,0x000000007fab1230)
+allocated by thread T0 here:
+    #0 0xffcd0000 in AsanInternalAllocate MdeModulePkg/Library/AsanLib/Asan.c:512
+SUMMARY: AddressSanitizer: heap-buffer-overflow MdePkg/Library/BaseMemoryLib/CopyMem.c:42 in CopyMem

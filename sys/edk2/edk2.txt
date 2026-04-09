@@ -18,6 +18,11 @@
 meta noextract
 meta arches["amd64"]
 
+# Memory mapping for the host executor's data segment. The implementation
+# in executor/common.h forwards to mmap() because the edk2 executor runs on
+# the Linux host (HostFuzzer mode); see executor_edk2.h.
+syz_mmap(addr vma, len len[addr])
+
 syz_edk2_run_program(prog ptr[in, edk2_program])
 
 edk2_program {

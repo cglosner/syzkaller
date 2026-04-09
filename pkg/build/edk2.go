@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/google/syzkaller/pkg/osutil"
@@ -44,8 +43,8 @@ func (ctx edk2) build(params Params) (ImageDetails, error) {
 	}
 
 	// Bootstrap BaseTools (cheap, idempotent).
-	if _, err := ctx.runShell(params, 10*time.Minute,
-		"make -C BaseTools -j%d", params.BuildCPUs); err != nil {
+	bootstrapCmd := fmt.Sprintf("make -C BaseTools -j%d", params.BuildCPUs)
+	if _, err := ctx.runShell(params, 10*time.Minute, bootstrapCmd); err != nil {
 		return ImageDetails{}, fmt.Errorf("edk2 build: BaseTools failed: %w", err)
 	}
 
@@ -102,11 +101,9 @@ func (ctx edk2) clean(params Params) error {
 	return os.RemoveAll(buildDir)
 }
 
-func (ctx edk2) runShell(params Params, timeout time.Duration, format string, args ...any) ([]byte, error) {
-	cmd := fmt.Sprintf(format, args...)
-	if !strings.Contains(cmd, ". ./edksetup.sh") {
-		// edksetup.sh requires WORKSPACE to point at the source tree; calling
-		// it from inside the source tree is what upstream documents.
-	}
+func (ctx edk2) runShell(params Params, timeout time.Duration, cmd string) ([]byte, error) {
+	// edksetup.sh requires WORKSPACE to point at the source tree; sourcing it
+	// from inside the source tree is what upstream documents, so we always
+	// invoke bash with cwd = params.KernelDir.
 	return osutil.RunCmd(timeout, params.KernelDir, "/bin/bash", "-c", cmd)
 }

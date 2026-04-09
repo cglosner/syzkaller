@@ -135,6 +135,7 @@ type Timeouts struct {
 }
 
 const (
+	EDK2    = "edk2"
 	FreeBSD = "freebsd"
 	Darwin  = "darwin"
 	Fuchsia = "fuchsia"
@@ -494,6 +495,22 @@ var List = map[string]map[string]*Target{
 			NeedSyscallDefine: dontNeedSyscallDefine,
 		},
 	},
+	EDK2: {
+		// edk2/amd64 targets the OvmfPkgX64 build of EDK2 running under QEMU/KVM.
+		// syz-executor runs on the Linux host (HostFuzzer mode) and talks to the
+		// in-firmware agent over a fw_cfg/ivshmem channel; see docs/edk2_design.md.
+		AMD64: {
+			PtrSize:   8,
+			PageSize:  4 << 10,
+			CCompiler: "clang",
+			CFlags:    []string{"-m64"},
+			// OVMF flash CODE region: top 4 MiB of the 4 GiB window.
+			KernelAddresses: KernelAddresses{
+				TextStart: 0x00000000FFE00000,
+				TextEnd:   0x0000000100000000,
+			},
+		},
+	},
 }
 
 var oses = map[string]osCommon{
@@ -580,6 +597,15 @@ var oses = map[string]osCommon{
 		SyscallNumbers:   true,
 		Int64SyscallArgs: true,
 		SyscallPrefix:    "__NR_",
+	},
+	EDK2: {
+		// EDK2 firmware has no syscall numbers; the only entry point is one
+		// pseudo-syscall (syz_edk2_run_program) that talks to SyzAgentDxe.
+		BuildOS:                Linux,
+		SyscallNumbers:         false,
+		ExecutorUsesForkServer: false,
+		HostFuzzer:             true,
+		KernelObject:           "OVMF.fd",
 	},
 }
 

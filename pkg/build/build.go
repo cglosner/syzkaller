@@ -174,6 +174,7 @@ func getBuilder(targetOS, targetArch, vmType string) (builder, error) {
 		targets.NetBSD:  netbsd{},
 		targets.FreeBSD: freebsd{},
 		targets.Darwin:  darwin{},
+		targets.EDK2:    edk2{},
 		targets.TestOS:  test{},
 	}
 	if builder, ok := builders[targetOS]; ok {

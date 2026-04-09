@@ -12,6 +12,9 @@ dashboard/app/config_prod.go
 # stub file used by Makefile
 .descriptions
 
+# tools/syz-edk2-test/run.sh scratch directory
+.syz-edk2-test/
+
 # coverage report created by make presubmit/test
 .coverage.txt
 

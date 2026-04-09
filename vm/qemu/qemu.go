@@ -268,6 +268,32 @@ var archConfigs = map[string]*archConfig{
 			"kernel.lockup-detector.heartbeat-age-fatal-threshold-ms=300000",
 		},
 	},
+	// edk2/amd64: boot OvmfPkgX64 as pflash, expose an ivshmem-plain region
+	// the host syz-executor uses to talk to SyzAgentDxe, and let the agent
+	// drive UEFI Boot/Runtime Services. See docs/edk2_design.md.
+	//
+	// The user must point efi_code_device at OVMF_CODE.fd from the syzkaller
+	// builder output, and efi_vars_device at a writable per-VM copy of
+	// OVMF_VARS.fd (vm/qemu rebuilds it on each launch from the
+	// OVMF_VARS.template.fd that pkg/build/edk2.go stashes).
+	"edk2/amd64": {
+		Qemu: "qemu-system-x86_64",
+		QemuArgs: strings.Join([]string{
+			"-machine q35,accel=kvm",
+			"-cpu host,migratable=off",
+			"-nodefaults",
+			"-no-reboot",
+			"-serial stdio",
+			"-debugcon file:edk2-debug.log -global isa-debugcon.iobase=0x402",
+			// SyzAgentDxe transport: an ivshmem-plain device backed by the
+			// per-VM file the executor passes via SYZ_EDK2_IVSHMEM. The
+			// {{TEMPLATE}} placeholder is expanded by splitArgs.
+			"-object memory-backend-file,id=syzcov,share=on,mem-path={{TEMPLATE}}/syz-edk2.shm,size=2M",
+			"-device ivshmem-plain,memdev=syzcov",
+		}, " "),
+		NetDev: "virtio-net-pci",
+		RngDev: "virtio-rng-pci",
+	},
 }
 
 func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
@@ -582,8 +608,15 @@ func (inst *instance) buildQemuArgs() ([]string, error) {
 		)
 	}
 	if inst.cfg.EfiVarsDevice != "" {
+		// For edk2 fuzzing the variable store must be writable so SetVariable
+		// reaches QemuFlashFvbServicesRuntimeDxe; pkg/build/edk2.go stashes a
+		// pristine OVMF_VARS.template.fd that the user copies per VM launch.
+		readonly := "readonly=on"
+		if inst.os == targets.EDK2 {
+			readonly = "readonly=off"
+		}
 		args = append(args,
-			"-drive", "if=pflash,format=raw,readonly=on,file="+inst.cfg.EfiVarsDevice,
+			"-drive", "if=pflash,format=raw,"+readonly+",file="+inst.cfg.EfiVarsDevice,
 		)
 	}
 	if inst.cfg.AppleSmcOsk != "" {

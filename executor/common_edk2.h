@@ -30,6 +30,17 @@
 // machine check correctly reports the feature as unavailable instead of
 // hanging.
 
+#if SYZ_EXECUTOR || __NR_syz_mmap
+#include <sys/mman.h>
+
+// syz_mmap(addr vma, len len[addr])
+static long syz_mmap(volatile long a0, volatile long a1)
+{
+	return (long)mmap((void*)a0, a1, PROT_READ | PROT_WRITE,
+			  MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0);
+}
+#endif
+
 #define SYZ_EDK2_PROGRAM_MAGIC 0x53595A45u
 
 #define SYZ_EDK2_OFF_MAGIC 0x0000

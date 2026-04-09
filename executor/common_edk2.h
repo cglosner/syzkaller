@@ -25,10 +25,19 @@
 // Coverage records (PCs) are written by SyzCoverLib into the next region
 // starting at offset 0x2000 as (uint32 nr_pcs; uint64 pcs[nr_pcs]).
 //
-// The shared memory page path is taken from the SYZ_EDK2_IVSHMEM environment
+// The shared memory page path is taken from the EDK2_IVSHMEM environment
 // variable. If unset, the pseudo-syscall returns ENODEV so syz-executor's
 // machine check correctly reports the feature as unavailable instead of
 // hanging.
+
+// Standalone syz-prog2c reproducers are compiled as plain C and don't pull in
+// the libc headers that the syz-executor build path provides via the surrounding
+// includes. Pull them in unconditionally so the generated reproducer compiles
+// without further plumbing. Mirrors common_test.h's strategy.
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
 #if SYZ_EXECUTOR || __NR_syz_mmap
 #include <sys/mman.h>
@@ -41,22 +50,25 @@ static long syz_mmap(volatile long a0, volatile long a1)
 }
 #endif
 
-#define SYZ_EDK2_PROGRAM_MAGIC 0x53595A45u
+#define EDK2_PROGRAM_MAGIC 0x53595A45u
 
-#define SYZ_EDK2_OFF_MAGIC 0x0000
-#define SYZ_EDK2_OFF_NCALLS 0x0004
-#define SYZ_EDK2_OFF_CALLS 0x0008
-#define SYZ_EDK2_OFF_HOST_SEQ 0x1000
-#define SYZ_EDK2_OFF_GUEST_SEQ 0x1004
-#define SYZ_EDK2_OFF_GUEST_STATUS 0x1008
-#define SYZ_EDK2_OFF_COVER 0x2000
+#define EDK2_OFF_MAGIC 0x0000
+#define EDK2_OFF_NCALLS 0x0004
+#define EDK2_OFF_CALLS 0x0008
+#define EDK2_OFF_HOST_SEQ 0x1000
+#define EDK2_OFF_GUEST_SEQ 0x1004
+#define EDK2_OFF_GUEST_STATUS 0x1008
+#define EDK2_OFF_COVER 0x2000
 
-#define SYZ_EDK2_PROG_BYTES (SYZ_EDK2_OFF_HOST_SEQ - SYZ_EDK2_OFF_CALLS)
-#define SYZ_EDK2_TIMEOUT_MS 5000
+#define EDK2_PROG_BYTES (EDK2_OFF_HOST_SEQ - EDK2_OFF_CALLS)
+#define EDK2_TIMEOUT_MS 5000
 
 #if SYZ_EXECUTOR || __NR_syz_edk2_run_program
 
+#include <errno.h>
 #include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -75,7 +87,7 @@ static int syz_edk2_open_channel(struct syz_edk2_channel* ch)
 {
 	if (ch->base != NULL)
 		return 0;
-	const char* path = getenv("SYZ_EDK2_IVSHMEM");
+	const char* path = getenv("EDK2_IVSHMEM");
 	if (path == NULL || *path == '\0') {
 		errno = ENODEV;
 		return -1;
@@ -88,7 +100,7 @@ static int syz_edk2_open_channel(struct syz_edk2_channel* ch)
 		close(fd);
 		return -1;
 	}
-	if (st.st_size < SYZ_EDK2_OFF_COVER + 4096) {
+	if (st.st_size < EDK2_OFF_COVER + 4096) {
 		close(fd);
 		errno = EINVAL;
 		return -1;
@@ -101,7 +113,7 @@ static int syz_edk2_open_channel(struct syz_edk2_channel* ch)
 	ch->base = (uint8*)p;
 	ch->size = (size_t)st.st_size;
 	ch->fd = fd;
-	ch->host_seq = *(volatile uint32*)(ch->base + SYZ_EDK2_OFF_HOST_SEQ);
+	ch->host_seq = *(volatile uint32*)(ch->base + EDK2_OFF_HOST_SEQ);
 	return 0;
 }
 
@@ -115,12 +127,12 @@ static long syz_edk2_run_program(volatile long a0)
 		errno = EFAULT;
 		return -1;
 	}
-	uint32 magic = *(const uint32*)(prog + SYZ_EDK2_OFF_MAGIC);
-	if (magic != SYZ_EDK2_PROGRAM_MAGIC) {
+	uint32 magic = *(const uint32*)(prog + EDK2_OFF_MAGIC);
+	if (magic != EDK2_PROGRAM_MAGIC) {
 		errno = EINVAL;
 		return -1;
 	}
-	uint32 ncalls = *(const uint32*)(prog + SYZ_EDK2_OFF_NCALLS);
+	uint32 ncalls = *(const uint32*)(prog + EDK2_OFF_NCALLS);
 	if (ncalls == 0 || ncalls > 32) {
 		errno = EINVAL;
 		return -1;
@@ -128,28 +140,28 @@ static long syz_edk2_run_program(volatile long a0)
 	// Copy header + raw call records into the shared region. We trust
 	// the prog package to have produced something the agent can parse;
 	// the agent does its own bounds checking before dereferencing.
-	memcpy(ch->base + SYZ_EDK2_OFF_MAGIC, prog, SYZ_EDK2_PROG_BYTES);
+	memcpy(ch->base + EDK2_OFF_MAGIC, prog, EDK2_PROG_BYTES);
 	// Reset coverage ring (first uint32 is the PC count).
-	*(volatile uint32*)(ch->base + SYZ_EDK2_OFF_COVER) = 0;
+	*(volatile uint32*)(ch->base + EDK2_OFF_COVER) = 0;
 	// Doorbell.
 	ch->host_seq++;
-	__atomic_store_n((volatile uint32*)(ch->base + SYZ_EDK2_OFF_GUEST_STATUS), 0,
+	__atomic_store_n((volatile uint32*)(ch->base + EDK2_OFF_GUEST_STATUS), 0,
 			 __ATOMIC_RELEASE);
-	__atomic_store_n((volatile uint32*)(ch->base + SYZ_EDK2_OFF_HOST_SEQ),
+	__atomic_store_n((volatile uint32*)(ch->base + EDK2_OFF_HOST_SEQ),
 			 ch->host_seq, __ATOMIC_RELEASE);
 	// Wait for the guest to ack.
 	struct timespec start, now;
 	clock_gettime(CLOCK_MONOTONIC, &start);
 	for (;;) {
 		uint32 guest_seq = __atomic_load_n(
-		    (volatile uint32*)(ch->base + SYZ_EDK2_OFF_GUEST_SEQ),
+		    (volatile uint32*)(ch->base + EDK2_OFF_GUEST_SEQ),
 		    __ATOMIC_ACQUIRE);
 		if (guest_seq == ch->host_seq)
 			break;
 		clock_gettime(CLOCK_MONOTONIC, &now);
 		long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000 +
 				  (now.tv_nsec - start.tv_nsec) / 1000000;
-		if (elapsed_ms >= SYZ_EDK2_TIMEOUT_MS) {
+		if (elapsed_ms >= EDK2_TIMEOUT_MS) {
 			errno = ETIMEDOUT;
 			return -1;
 		}
@@ -158,7 +170,7 @@ static long syz_edk2_run_program(volatile long a0)
 		nanosleep(&ts, NULL);
 	}
 	uint32 status = __atomic_load_n(
-	    (volatile uint32*)(ch->base + SYZ_EDK2_OFF_GUEST_STATUS),
+	    (volatile uint32*)(ch->base + EDK2_OFF_GUEST_STATUS),
 	    __ATOMIC_ACQUIRE);
 	if (status != 0) {
 		errno = EIO;
@@ -174,7 +186,9 @@ static long syz_edk2_run_program(volatile long a0)
 // common_linux.h / common_fuchsia.h so executor.cc's SYZ_THREADED block
 // builds unchanged.
 #if SYZ_EXECUTOR || SYZ_THREADED
+#include <errno.h>
 #include <pthread.h>
+#include <time.h>
 
 typedef struct {
 	pthread_mutex_t mu;
@@ -224,6 +238,7 @@ static int event_isset(event_t* ev)
 
 static int event_timedwait(event_t* ev, uint64 timeout_ms)
 {
+	uint64 deadline_ms = current_time_ms() + timeout_ms;
 	struct timespec ts;
 	clock_gettime(CLOCK_REALTIME, &ts);
 	ts.tv_sec += timeout_ms / 1000;
@@ -236,6 +251,8 @@ static int event_timedwait(event_t* ev, uint64 timeout_ms)
 	int res = 0;
 	while (!ev->state) {
 		if (pthread_cond_timedwait(&ev->cv, &ev->mu, &ts) == ETIMEDOUT)
+			break;
+		if (current_time_ms() > deadline_ms)
 			break;
 	}
 	res = ev->state;
@@ -255,11 +272,16 @@ static int do_sandbox_none(void)
 }
 #endif
 
-// remove_dir is referenced by executor_runner.h's ExecuteBinary path. Since
-// the host executor for edk2 never invokes that path (the program is sent to
-// SyzAgentDxe instead), a thin wrapper around the Linux helpers is enough.
+// remove_dir is referenced by executor_runner.h's ExecuteBinary path inside
+// syz-executor proper; standalone syz-prog2c reproducers never call it, so
+// gate it on SYZ_EXECUTOR to keep the reproducer C file lean and quiet.
+#if SYZ_EXECUTOR
 #include <dirent.h>
+#include <limits.h>
+#include <stdio.h>
+#include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 static void remove_dir(const char* dir)
 {
@@ -281,3 +303,4 @@ static void remove_dir(const char* dir)
 	closedir(dp);
 	rmdir(dir);
 }
+#endif

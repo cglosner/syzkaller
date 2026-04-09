@@ -33,6 +33,8 @@ DURATION="${DURATION:-30s}"
 SEED="${SEED:-1}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 USE_SYZ_ENV="${USE_SYZ_ENV:-1}"
+SNAPSHOT_EVERY="${SNAPSHOT_EVERY:-0}"
+CALL_SET="${CALL_SET:-all}"
 
 mkdir -p "${WORKDIR}"
 
@@ -124,6 +126,8 @@ run_fuzz() {
         -qemu "${qemu_bin}" \
         -duration "${DURATION}" \
         -seed "${SEED}" \
+        -snapshot-every "${SNAPSHOT_EVERY}" \
+        -call-set "${CALL_SET}" \
         > "${SUMMARY}" 2> "${WORKDIR}/fuzz-stderr.log"
 }
 

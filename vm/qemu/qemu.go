@@ -282,17 +282,14 @@ var archConfigs = map[string]*archConfig{
 			"-machine q35,accel=kvm",
 			"-cpu host,migratable=off",
 			"-nodefaults",
-			"-no-reboot",
-			"-serial stdio",
-			"-debugcon file:edk2-debug.log -global isa-debugcon.iobase=0x402",
+			"-debugcon file:{{TEMPLATE}}/edk2-debug.log -global isa-debugcon.iobase=0x402",
 			// SyzAgentDxe transport: an ivshmem-plain device backed by the
-			// per-VM file the executor passes via SYZ_EDK2_IVSHMEM. The
-			// {{TEMPLATE}} placeholder is expanded by splitArgs.
-			"-object memory-backend-file,id=syzcov,share=on,mem-path={{TEMPLATE}}/syz-edk2.shm,size=2M",
+			// per-VM file the executor passes via EDK2_IVSHMEM.
+			"-object memory-backend-file,id=syzcov,share=on,mem-path={{TEMPLATE}}/syz-edk2.shm,size=256M",
 			"-device ivshmem-plain,memdev=syzcov",
 		}, " "),
-		NetDev: "virtio-net-pci",
-		RngDev: "virtio-rng-pci",
+		// Empty NetDev/RngDev — firmware has no network stack that needs them
+		// and the default -serial stdio from buildQemuArgs is sufficient.
 	},
 }
 
@@ -475,6 +472,23 @@ func (inst *instance) Close() error {
 
 func (inst *instance) boot() error {
 	inst.monport = vmimpl.UnusedTCPPort()
+	// edk2: pre-create the ivshmem backing file before QEMU opens it.
+	// The file must exist and be the right size (256 MiB). We zero it
+	// on each boot so the asan shadow window starts clean.
+	if inst.target.OS == targets.EDK2 {
+		shmPath := filepath.Join(inst.workdir, "template", "syz-edk2.shm")
+		os.MkdirAll(filepath.Dir(shmPath), 0755)
+		os.Remove(shmPath)
+		f, err := os.Create(shmPath)
+		if err != nil {
+			return fmt.Errorf("failed to create ivshmem backing file: %w", err)
+		}
+		if err := f.Truncate(256 << 20); err != nil {
+			f.Close()
+			return fmt.Errorf("failed to truncate ivshmem backing file: %w", err)
+		}
+		f.Close()
+	}
 	args, err := inst.buildQemuArgs()
 	if err != nil {
 		return err
@@ -525,14 +539,76 @@ func (inst *instance) boot() error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if err := vmimpl.WaitForSSH(10*time.Minute*inst.timeouts.Scale, inst.SSHOptions,
-		inst.os, inst.merger.Errors(ctx), false, inst.debug); err != nil {
-		bootOutputStop <- true
-		<-bootOutputStop
-		return vmimpl.MakeBootError(err, bootOutput)
+	if inst.target.OS == targets.EDK2 {
+		// edk2 has no SSH — it's bare firmware. Wait for the SyzAgentDxe
+		// "transport ready" message in the console output, which signals
+		// that the ivshmem BAR has been discovered and the dispatch timer
+		// is armed. The executor can then mmap the backing file and poke
+		// programs across the doorbell.
+		if err := inst.waitForAgentReady(bootOutput, bootOutputStop); err != nil {
+			bootOutputStop <- true
+			<-bootOutputStop
+			return vmimpl.MakeBootError(err, bootOutput)
+		}
+	} else {
+		if err := vmimpl.WaitForSSH(10*time.Minute*inst.timeouts.Scale, inst.SSHOptions,
+			inst.os, inst.merger.Errors(ctx), false, inst.debug); err != nil {
+			bootOutputStop <- true
+			<-bootOutputStop
+			return vmimpl.MakeBootError(err, bootOutput)
+		}
 	}
 	bootOutputStop <- true
 	return nil
+}
+
+// waitForAgentReady waits for the SyzAgentDxe dispatch loop to become
+// responsive. We send a nop program through the ivshmem backing file
+// and poll for the guest ack — the same handshake syz-edk2-fuzz uses.
+func (inst *instance) waitForAgentReady(bootOutput []byte, stop chan bool) error {
+	shmPath := filepath.Join(inst.workdir, "template", "syz-edk2.shm")
+	deadline := time.Now().Add(2 * time.Minute * inst.timeouts.Scale)
+	var hostSeq uint32
+	for time.Now().Before(deadline) {
+		f, err := os.OpenFile(shmPath, os.O_RDWR|os.O_SYNC, 0)
+		if err != nil {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		// Write nop program at offset 0: magic + ncalls=1 + nop record.
+		nop := []byte{
+			0x45, 0x5A, 0x59, 0x53, // SYZE magic
+			0x01, 0x00, 0x00, 0x00, // ncalls=1
+			0x01, 0x00, 0x00, 0x00, // call=1 (nop)
+			0x10, 0x00, 0x00, 0x00, // size=16
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // cookie
+		}
+		f.WriteAt(nop, 0)
+		// Bump host_seq at offset 0x1000.
+		hostSeq++
+		seqBuf := []byte{byte(hostSeq), byte(hostSeq >> 8), byte(hostSeq >> 16), byte(hostSeq >> 24)}
+		f.WriteAt(seqBuf, 0x1000)
+		f.Sync()
+		f.Close()
+		// Poll for guest_seq == hostSeq at offset 0x1004.
+		ackDeadline := time.Now().Add(500 * time.Millisecond)
+		for time.Now().Before(ackDeadline) {
+			f2, err := os.Open(shmPath)
+			if err != nil {
+				break
+			}
+			var ackBuf [4]byte
+			f2.ReadAt(ackBuf[:], 0x1004)
+			f2.Close()
+			guestSeq := uint32(ackBuf[0]) | uint32(ackBuf[1])<<8 |
+				uint32(ackBuf[2])<<16 | uint32(ackBuf[3])<<24
+			if guestSeq == hostSeq {
+				return nil
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	return fmt.Errorf("SyzAgentDxe did not respond to nop poke within deadline")
 }
 
 func (inst *instance) buildQemuArgs() ([]string, error) {
@@ -551,11 +627,17 @@ func (inst *instance) buildQemuArgs() ([]string, error) {
 	}
 	templateDir := filepath.Join(inst.workdir, "template")
 	args = append(args, splitArgs(inst.cfg.QemuArgs, templateDir, inst.index)...)
-	args = append(args,
-		"-device", inst.cfg.NetDev+",netdev=net0",
-		"-netdev", fmt.Sprintf("user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:%v-:22", inst.Port),
-	)
-	if inst.image == "9p" {
+	if inst.target.OS != targets.EDK2 {
+		// edk2 firmware has no network stack or SSH — skip the user-mode
+		// network device and SSH port forwarding entirely.
+		args = append(args,
+			"-device", inst.cfg.NetDev+",netdev=net0",
+			"-netdev", fmt.Sprintf("user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:%v-:22", inst.Port),
+		)
+	}
+	if inst.target.OS == targets.EDK2 {
+		// edk2: firmware boots from pflash, no disk image needed.
+	} else if inst.image == "9p" {
 		args = append(args,
 			"-fsdev", "local,id=fsdev0,path=/,security_model=none,readonly",
 			"-device", "virtio-9p-pci,fsdev=fsdev0,mount_tag=/dev/root",
@@ -697,6 +779,15 @@ func (inst *instance) targetDir() string {
 func (inst *instance) Copy(hostSrc string) (string, error) {
 	base := filepath.Base(hostSrc)
 	vmDst := filepath.Join(inst.targetDir(), base)
+	if inst.target.OS == targets.EDK2 {
+		// edk2 HostFuzzer: all binaries run on the host, no SCP needed.
+		// Just track the file mapping and return the host path.
+		if inst.files == nil {
+			inst.files = make(map[string]string)
+		}
+		inst.files[vmDst] = hostSrc
+		return hostSrc, nil
+	}
 	if inst.target.HostFuzzer {
 		if base == "syz-execprog" {
 			return hostSrc, nil // we will run these on host
@@ -737,16 +828,26 @@ func (inst *instance) Run(ctx context.Context, command string) (
 	sshArgs := vmimpl.SSHArgsForward(inst.debug, inst.Key, inst.Port, inst.forwardPort, false)
 	args := strings.Split(command, " ")
 	if bin := filepath.Base(args[0]); inst.target.HostFuzzer && bin == "syz-execprog" {
-		// Weird mode for Fuchsia.
-		// Fuzzer and execprog are on host (we did not copy them), so we will run them as is,
-		// but we will also wrap executor with ssh invocation.
-		for i, arg := range args {
-			if strings.HasPrefix(arg, "-executor=") {
-				args[i] = "-executor=" + "/usr/bin/ssh " + strings.Join(sshArgs, " ") +
-					" " + inst.User + "@localhost " + arg[len("-executor="):]
+		if inst.target.OS == targets.EDK2 {
+			// edk2 HostFuzzer mode: executor runs locally and talks to the
+			// firmware via ivshmem shared memory. Set EDK2_IVSHMEM to the
+			// per-VM backing file so common_edk2.h's syz_edk2_open_channel
+			// can mmap it. No SSH wrapping needed — the firmware has no OS.
+			for i, arg := range args {
+				if host := inst.files[arg]; host != "" {
+					args[i] = host
+				}
 			}
-			if host := inst.files[arg]; host != "" {
-				args[i] = host
+		} else {
+			// Fuchsia mode: executor is wrapped via SSH.
+			for i, arg := range args {
+				if strings.HasPrefix(arg, "-executor=") {
+					args[i] = "-executor=" + "/usr/bin/ssh " + strings.Join(sshArgs, " ") +
+						" " + inst.User + "@localhost " + arg[len("-executor="):]
+				}
+				if host := inst.files[arg]; host != "" {
+					args[i] = host
+				}
 			}
 		}
 	} else {
@@ -761,6 +862,12 @@ func (inst *instance) Run(ctx context.Context, command string) (
 	cmd.Dir = inst.workdir
 	cmd.Stdout = wpipe
 	cmd.Stderr = wpipeErr
+	if inst.target.OS == targets.EDK2 {
+		// edk2 executor needs EDK2_IVSHMEM pointing to the per-VM
+		// ivshmem backing file so it can mmap the shared memory region.
+		shmPath := filepath.Join(inst.workdir, "template", "syz-edk2.shm")
+		cmd.Env = append(os.Environ(), "EDK2_IVSHMEM="+shmPath)
+	}
 	if err := cmd.Start(); err != nil {
 		wpipe.Close()
 		wpipeErr.Close()

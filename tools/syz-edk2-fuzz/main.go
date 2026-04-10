@@ -223,10 +223,32 @@ func main() {
 	}
 
 	progsThisVM := uint64(0)
+	consecutiveTimeouts := 0
+	const maxConsecutiveTimeouts = 10 // auto-restart after 10 consecutive timeouts
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
 		default:
+		}
+		// Auto-restart if the agent appears dead (N consecutive timeouts
+		// means the firmware hit a CpuDeadLoop from an ASSERT or exception).
+		if consecutiveTimeouts >= maxConsecutiveTimeouts {
+			fmt.Fprintf(os.Stderr, "[auto-restart] %d consecutive timeouts — restarting QEMU\n",
+				consecutiveTimeouts)
+			_ = qemu.Process.Kill()
+			_, _ = qemu.Process.Wait()
+			for i := range shmem.Data[edk2OffHostSeq : edk2OffHostSeq+12] {
+				shmem.Data[int(edk2OffHostSeq)+i] = 0
+			}
+			writeU32(shmem.Data, edk2OffCoverCount, 0)
+			_ = copyFile(*flagOvmfVars, varsCopy)
+			qemu = launchQemu(ctx, varsCopy)
+			if err := waitForAgent(shmem.Data); err != nil {
+				st.Timeouts.Add(1)
+				break
+			}
+			progsThisVM = 0
+			consecutiveTimeouts = 0
 		}
 		// Cold-restart for state isolation if -snapshot-every is set.
 		if *flagSnapshot > 0 && progsThisVM >= uint64(*flagSnapshot) {
@@ -281,6 +303,7 @@ func main() {
 		ok := pokeAgent(shmem.Data, prog, *flagPokeTimeout)
 		if !ok {
 			st.Timeouts.Add(1)
+			consecutiveTimeouts++
 			if *flagVerbose || st.Programs.Load() < 5 {
 				fmt.Fprintf(os.Stderr,
 					"[poke %d] TIMEOUT ncalls=%d wirelen=%d host_seq=%d guest_seq=%d\n",
@@ -290,6 +313,7 @@ func main() {
 			}
 			continue
 		}
+		consecutiveTimeouts = 0
 		status := readU32(shmem.Data, edk2OffGuestStatus)
 		if status != 0 {
 			st.GuestErrors.Add(1)

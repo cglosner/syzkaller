@@ -141,14 +141,19 @@ func main() {
 		fail("copy vars: %v", err)
 	}
 
-	// Pre-allocate the ivshmem backing file (2 MiB; matches what
-	// OvmfPkgX64.dsc / vm/qemu agree on).
-	if err := truncateShmem(*flagShmem, 2<<20); err != nil {
+	// Pre-allocate the ivshmem backing file. The first 2 MiB are the
+	// SyzAgent control region (program payload + doorbell + cover ring).
+	// Everything past offset 0x200000 is reserved for the asan shadow
+	// window when ASAN_INSTRUMENT=TRUE OVMF builds late-bind it via
+	// gAsanShadowReadyProtocolGuid. 256 MiB total ⇒ 254 MiB shadow ⇒
+	// ~2 GiB of trackable physical-memory range at SHADOW_SCALE=3.
+	const shmemSize = 256 << 20
+	if err := truncateShmem(*flagShmem, shmemSize); err != nil {
 		fail("create shmem: %v", err)
 	}
 
 	// Mmap the shmem so we can poke and read directly.
-	shmem, err := mmapFile(*flagShmem, 2<<20)
+	shmem, err := mmapFile(*flagShmem, shmemSize)
 	if err != nil {
 		fail("mmap shmem: %v", err)
 	}
@@ -546,7 +551,7 @@ func pokeAgent(data []byte, prog *program, timeout time.Duration) bool {
 // deadline accommodates ASAN+coverage-instrumented builds, which can
 // take ~30 s to boot all the way into BDS on a busy host.
 func waitForAgent(data []byte) error {
-	deadline := time.Now().Add(60 * time.Second)
+	deadline := time.Now().Add(90 * time.Second)
 	rng := rand.New(rand.NewSource(0xa9e21))
 	for time.Now().Before(deadline) {
 		var buf bytes.Buffer
@@ -591,7 +596,7 @@ func launchQemu(ctx context.Context, varsCopy string) *exec.Cmd {
 		"-drive", "if=pflash,format=raw,file=" + varsCopy,
 		"-debugcon", "file:" + *flagOvmfDebug,
 		"-global", "isa-debugcon.iobase=0x402",
-		"-object", fmt.Sprintf("memory-backend-file,id=syzcov,share=on,mem-path=%s,size=2M", *flagShmem),
+		"-object", fmt.Sprintf("memory-backend-file,id=syzcov,share=on,mem-path=%s,size=256M", *flagShmem),
 		"-device", "ivshmem-plain,memdev=syzcov",
 	}
 	cmd := exec.CommandContext(ctx, *flagQemu, args...)

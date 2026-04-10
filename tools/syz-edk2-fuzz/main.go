@@ -148,6 +148,12 @@ func main() {
 	// gAsanShadowReadyProtocolGuid. 256 MiB total ⇒ 254 MiB shadow ⇒
 	// ~2 GiB of trackable physical-memory range at SHADOW_SCALE=3.
 	const shmemSize = 256 << 20
+	// Always start with a freshly-zeroed backing file. The asan shadow
+	// region lives at offset 0x200000 onward and a single non-zero
+	// byte left over from a previous run would make every instrumented
+	// load misfire as a "use-after-poison" — much easier to wipe up
+	// front than to scrub from the guest.
+	_ = os.Remove(*flagShmem)
 	if err := truncateShmem(*flagShmem, shmemSize); err != nil {
 		fail("create shmem: %v", err)
 	}

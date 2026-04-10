@@ -33,6 +33,8 @@ DURATION="${DURATION:-30s}"
 SEED="${SEED:-1}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 USE_SYZ_ENV="${USE_SYZ_ENV:-1}"
+ASAN_INSTRUMENT="${ASAN_INSTRUMENT:-FALSE}"
+UBSAN_INSTRUMENT="${UBSAN_INSTRUMENT:-FALSE}"
 SNAPSHOT_EVERY="${SNAPSHOT_EVERY:-0}"
 CALL_SET="${CALL_SET:-all}"
 USE_GRAMMAR="${USE_GRAMMAR:-1}"
@@ -87,11 +89,19 @@ if [[ "${SKIP_BUILD}" == "0" ]]; then
     ( cd "${EDK2_DIR}" && make -C BaseTools -j"$(nproc)" >/dev/null 2>&1 ) \
         || die "BaseTools build failed"
 
-    step "building OVMF with SYZ_AGENT_ENABLE=TRUE ASAN_ENABLE=TRUE"
+    step "building OVMF with SYZ_AGENT_ENABLE=TRUE ASAN_INSTRUMENT=${ASAN_INSTRUMENT} UBSAN_INSTRUMENT=${UBSAN_INSTRUMENT}"
+    extra_build_args=""
+    if [[ "${ASAN_INSTRUMENT:-FALSE}" == "TRUE" || "${UBSAN_INSTRUMENT:-FALSE}" == "TRUE" ]]; then
+        # Instrumented builds bust the default 4 MiB FVMAIN_COMPACT.
+        extra_build_args="-D FD_SIZE_IN_KB=8192"
+    fi
     ( cd "${EDK2_DIR}" && bash -c '
         . ./edksetup.sh >/dev/null
         build -p OvmfPkg/OvmfPkgX64.dsc -a X64 -t GCC5 -b NOOPT \
-            -D SYZ_AGENT_ENABLE=TRUE -D ASAN_ENABLE=TRUE -n '"$(nproc)" ) \
+            -D SYZ_AGENT_ENABLE=TRUE -D ASAN_ENABLE=TRUE \
+            -D ASAN_INSTRUMENT='"${ASAN_INSTRUMENT:-FALSE}"' \
+            -D UBSAN_INSTRUMENT='"${UBSAN_INSTRUMENT:-FALSE}"' \
+            '"${extra_build_args}"' -n '"$(nproc)" ) \
         > "${WORKDIR}/edk2-build.log" 2>&1 \
         || { tail -30 "${WORKDIR}/edk2-build.log"; die "OVMF build failed"; }
     ok "OVMF built (log: ${WORKDIR}/edk2-build.log)"

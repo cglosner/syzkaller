@@ -825,20 +825,18 @@ func (inst *instance) Run(ctx context.Context, command string) (
 	inst.merger.Add("ssh", vmimpl.OutputStdout, rpipe)
 	inst.merger.Add("ssh-err", vmimpl.OutputStderr, rpipeErr)
 
-	sshArgs := vmimpl.SSHArgsForward(inst.debug, inst.Key, inst.Port, inst.forwardPort, false)
 	args := strings.Split(command, " ")
-	if bin := filepath.Base(args[0]); inst.target.HostFuzzer && bin == "syz-execprog" {
-		if inst.target.OS == targets.EDK2 {
-			// edk2 HostFuzzer mode: executor runs locally and talks to the
-			// firmware via ivshmem shared memory. Set EDK2_IVSHMEM to the
-			// per-VM backing file so common_edk2.h's syz_edk2_open_channel
-			// can mmap it. No SSH wrapping needed — the firmware has no OS.
-			for i, arg := range args {
-				if host := inst.files[arg]; host != "" {
-					args[i] = host
-				}
+	if inst.target.OS == targets.EDK2 {
+		// edk2 HostFuzzer mode: ALL commands run locally on the host.
+		// The executor talks to the firmware via ivshmem, not SSH.
+		for i, arg := range args {
+			if host := inst.files[arg]; host != "" {
+				args[i] = host
 			}
-		} else {
+		}
+	} else {
+		sshArgs := vmimpl.SSHArgsForward(inst.debug, inst.Key, inst.Port, inst.forwardPort, false)
+		if bin := filepath.Base(args[0]); inst.target.HostFuzzer && bin == "syz-execprog" {
 			// Fuchsia mode: executor is wrapped via SSH.
 			for i, arg := range args {
 				if strings.HasPrefix(arg, "-executor=") {
@@ -849,11 +847,11 @@ func (inst *instance) Run(ctx context.Context, command string) (
 					args[i] = host
 				}
 			}
+		} else {
+			args = []string{"ssh"}
+			args = append(args, sshArgs...)
+			args = append(args, inst.User+"@localhost", "cd "+inst.targetDir()+" && "+command)
 		}
-	} else {
-		args = []string{"ssh"}
-		args = append(args, sshArgs...)
-		args = append(args, inst.User+"@localhost", "cd "+inst.targetDir()+" && "+command)
 	}
 	if inst.debug {
 		log.Logf(0, "running command: %#v", args)

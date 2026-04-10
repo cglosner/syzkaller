@@ -504,9 +504,11 @@ var List = map[string]map[string]*Target{
 			PageSize:  4 << 10,
 			CCompiler: "clang",
 			CFlags:    []string{"-m64"},
-			// OVMF flash CODE region: top 4 MiB of the 4 GiB window.
+			// DXE drivers load into RAM (~0x3B000000-0x3FFFFFFF on Q35
+			// with 1 GiB). Use the full 32-bit range so all PCs from
+			// both DXE RAM and the flash CODE region are accepted.
 			KernelAddresses: KernelAddresses{
-				TextStart: 0x00000000FFE00000,
+				TextStart: 0x0000000000000000,
 				TextEnd:   0x0000000100000000,
 			},
 		},

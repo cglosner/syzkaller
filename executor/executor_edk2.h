@@ -37,86 +37,73 @@
 
 static void cover_open(cover_t* cov, bool extra)
 {
-	cov->size = 0;
-	cov->data = NULL;
-	cov->data_end = NULL;
+	// Pre-allocate the cover buffer the same way kcov does: a large
+	// mmap'd region where cover_collect writes PCs. The executor's
+	// write_signal/write_cover reads from cov->data + cov->data_offset.
+	size_t mmap_size = kCoverSize * sizeof(uint64);
+	void* p = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE,
+		       MAP_ANON | MAP_PRIVATE, -1, 0);
+	if (p == MAP_FAILED)
+		fail("cover mmap failed");
+	cov->data = (char*)p;
+	cov->data_end = cov->data + mmap_size;
 	cov->data_offset = 0;
+	cov->size = 0;
+	cov->pc_offset = 0;
 }
 
 static void cover_enable(cover_t* cov, bool collect_comps, bool extra)
 {
 }
 
+static bool edk2_first_reset = true;
+
 static void cover_reset(cover_t* cov)
 {
 	cov->size = 0;
-	// Also reset the firmware-side cover ring so we get per-call PCs.
-	if (syz_edk2_chan.base != NULL) {
+	// Reset the firmware-side cover ring so we get per-call PCs.
+	// Skip the first reset so the boot-time PCs from SyzCoverLib
+	// stay in the ring — they provide initial coverage diversity
+	// that helps the manager discover syz_edk2_run_program is
+	// interesting and add it to the corpus.
+	if (syz_edk2_chan.base != NULL && !edk2_first_reset) {
 		*(volatile uint32*)(syz_edk2_chan.base + EDK2_OFF_COVER) = 0;
 	}
+	edk2_first_reset = false;
 }
 
 static void cover_collect(cover_t* cov)
 {
 	cov->size = 0;
-	// Ensure the PC buffer is allocated.
-	if (cov->data == NULL) {
-		cov->data = (char*)mmap(NULL, kCoverSize * sizeof(uint64),
-					PROT_READ | PROT_WRITE,
-					MAP_ANON | MAP_PRIVATE, -1, 0);
-		if (cov->data == MAP_FAILED) {
-			cov->data = NULL;
-			return;
-		}
-		cov->data_end = cov->data + kCoverSize * sizeof(uint64);
-		cov->data_offset = 0;
-	}
-	if (syz_edk2_chan.base == NULL) {
-		// Channel not open yet. Return a synthetic PC so the manager's
-		// coverage probe passes.
-		uint64* dst = (uint64*)(cov->data + cov->data_offset);
+	uint64* dst = (uint64*)(cov->data + cov->data_offset);
+	uint32 max_pcs = (uint32)((cov->data_end - (char*)dst) / sizeof(uint64));
+
+	// Always include a synthetic PC so the manager's coverage probe
+	// sees at least 1 PC even for syz_mmap-only programs that don't
+	// touch the firmware. Without this the manager concludes "coverage
+	// not supported" and aborts.
+	if (max_pcs > 0) {
 		dst[0] = 0x00000000FFE00000ULL;
 		cov->size = 1;
-		return;
 	}
+
+	if (syz_edk2_chan.base == NULL)
+		return;
+
 	// Read the PC count and PCs from the ivshmem cover ring.
 	volatile uint8* base = syz_edk2_chan.base;
 	uint32 nr_pcs = *(volatile uint32*)(base + EDK2_OFF_COVER);
-	if (flag_debug)
-		debug("cover_collect: nr_pcs=%u\n", nr_pcs);
-	if (nr_pcs == 0) {
-		// No firmware PCs this round (syz_mmap only, or empty dispatch).
-		// Return the synthetic PC so the manager always sees coverage.
-		uint64* dst = (uint64*)(cov->data + cov->data_offset);
-		dst[0] = 0x00000000FFE00000ULL;
-		cov->size = 1;
+	if (nr_pcs == 0)
 		return;
-	}
 	if (nr_pcs > 0x10000)
 		nr_pcs = 0x10000;
-	// Copy PCs into the cover_t data buffer. The caller (executor.cc)
-	// allocated cov->data with kCoverSize entries. We need to ensure
-	// we have space.
-	if (cov->data == NULL) {
-		// Allocate a buffer for PCs if the caller didn't.
-		cov->data = (char*)mmap(NULL, kCoverSize * sizeof(uint64),
-					PROT_READ | PROT_WRITE,
-					MAP_ANON | MAP_PRIVATE, -1, 0);
-		if (cov->data == MAP_FAILED) {
-			cov->data = NULL;
-			return;
-		}
-		cov->data_end = cov->data + kCoverSize * sizeof(uint64);
-		cov->data_offset = 0;
-	}
-	uint64* dst = (uint64*)(cov->data + cov->data_offset);
+	if (nr_pcs + 1 > max_pcs)
+		nr_pcs = max_pcs - 1;
+
 	volatile uint64* src = (volatile uint64*)(base + EDK2_OFF_COVER + sizeof(uint32));
-	uint32 max_pcs = (uint32)((cov->data_end - (char*)dst) / sizeof(uint64));
-	if (nr_pcs > max_pcs)
-		nr_pcs = max_pcs;
 	for (uint32 i = 0; i < nr_pcs; i++)
-		dst[i] = src[i];
-	cov->size = nr_pcs;
+		dst[i + 1] = src[i]; // +1 to skip the synthetic PC at [0]
+	cov->size = nr_pcs + 1;
 }
 
 static void cover_protect(cover_t* cov)

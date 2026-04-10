@@ -88,6 +88,7 @@ static int syz_edk2_open_channel(struct syz_edk2_channel* ch)
 	if (ch->base != NULL)
 		return 0;
 	const char* path = getenv("EDK2_IVSHMEM");
+	debug("syz_edk2_open_channel: EDK2_IVSHMEM=%s\n", path ? path : "(null)");
 	if (path == NULL || *path == '\0') {
 		errno = ENODEV;
 		return -1;

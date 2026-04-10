@@ -47,14 +47,23 @@ public:
 		if (posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP))
 			fail("posix_spawnattr_setflags failed");
 
-		const char* child_envp[] = {
-		    // Tell ASAN to not mess with our NONFAILING and disable leak checking
-		    // (somehow lsan is very slow in syzbot arm64 image and we are not very interested
-		    // in leaks in the exec subprocess, it does not use malloc/new anyway).
+		// Build the child environment. We pass a minimal set to avoid
+		// interference, but edk2 needs EDK2_IVSHMEM for the ivshmem
+		// shared memory transport.
+		const char* edk2_ivshmem = getenv("EDK2_IVSHMEM");
+		static char edk2_env_buf[512];
+		if (edk2_ivshmem)
+			snprintf(edk2_env_buf, sizeof(edk2_env_buf), "EDK2_IVSHMEM=%s", edk2_ivshmem);
+		const char* child_envp_with_edk2[] = {
 		    "ASAN_OPTIONS=handle_segv=0 allow_user_segv_handler=1 detect_leaks=0",
-		    // Disable rseq since we don't use it and we want to [ab]use it ourselves for kernel testing.
+		    "GLIBC_TUNABLES=glibc.pthread.rseq=0",
+		    edk2_env_buf,
+		    nullptr};
+		const char* child_envp_plain[] = {
+		    "ASAN_OPTIONS=handle_segv=0 allow_user_segv_handler=1 detect_leaks=0",
 		    "GLIBC_TUNABLES=glibc.pthread.rseq=0",
 		    nullptr};
+		const char** child_envp = edk2_ivshmem ? child_envp_with_edk2 : child_envp_plain;
 
 		if (posix_spawnp(&pid_, argv[0], &actions, &attr,
 				 const_cast<char**>(argv), const_cast<char**>(child_envp)))

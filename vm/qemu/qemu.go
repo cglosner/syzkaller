@@ -863,8 +863,11 @@ func (inst *instance) Run(ctx context.Context, command string) (
 	if inst.target.OS == targets.EDK2 {
 		// edk2 executor needs EDK2_IVSHMEM pointing to the per-VM
 		// ivshmem backing file so it can mmap the shared memory region.
+		// Use os.Setenv to propagate to all child processes (cmd.Env
+		// didn't work — the executor's runner subprocess didn't inherit).
 		shmPath := filepath.Join(inst.workdir, "template", "syz-edk2.shm")
-		cmd.Env = append(os.Environ(), "EDK2_IVSHMEM="+shmPath)
+		os.Setenv("EDK2_IVSHMEM", shmPath)
+		log.Logf(0, "edk2: setting EDK2_IVSHMEM=%v for executor", shmPath)
 	}
 	if err := cmd.Start(); err != nil {
 		wpipe.Close()

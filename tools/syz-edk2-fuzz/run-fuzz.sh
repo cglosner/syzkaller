@@ -91,11 +91,17 @@ if [[ "${SKIP_BUILD}" == "0" ]]; then
 
     step "building OVMF with SYZ_AGENT_ENABLE=TRUE ASAN_INSTRUMENT=${ASAN_INSTRUMENT} UBSAN_INSTRUMENT=${UBSAN_INSTRUMENT}"
     extra_build_args=""
+    extra_env=""
     if [[ "${ASAN_INSTRUMENT:-FALSE}" == "TRUE" || "${UBSAN_INSTRUMENT:-FALSE}" == "TRUE" ]]; then
         # Instrumented builds bust the default 4 MiB FVMAIN_COMPACT.
         extra_build_args="-D FD_SIZE_IN_KB=8192"
+        # The gcc-kasan-wrapper strips -fasan-shadow-offset from the
+        # command line when -fno-sanitize=kernel-address is also present
+        # (needed for per-component carve-outs like SyzAgentDxe).
+        extra_env="GCC5_BIN=${EDK2_DIR}/BaseTools/BinWrappers/PosixLike/gcc-wrap/"
     fi
     ( cd "${EDK2_DIR}" && bash -c '
+        export '"${extra_env}"'
         . ./edksetup.sh >/dev/null
         build -p OvmfPkg/OvmfPkgX64.dsc -a X64 -t GCC5 -b NOOPT \
             -D SYZ_AGENT_ENABLE=TRUE -D ASAN_ENABLE=TRUE \

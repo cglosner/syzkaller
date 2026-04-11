@@ -660,6 +660,12 @@ func drainCoverage(data []byte, set map[uint64]struct{}) {
 // ---------- QEMU launch ----------
 
 func launchQemu(ctx context.Context, varsCopy string) *exec.Cmd {
+	// Create a fuzz disk for BlockIo/DiskIo targets.
+	diskPath := filepath.Join(*flagWorkdir, "fuzz-disk.img")
+	if df, err := os.Create(diskPath); err == nil {
+		df.Truncate(64 << 20)
+		df.Close()
+	}
 	args := []string{
 		"-machine", "q35,accel=kvm",
 		"-cpu", "host",
@@ -674,6 +680,14 @@ func launchQemu(ctx context.Context, varsCopy string) *exec.Cmd {
 		"-global", "isa-debugcon.iobase=0x402",
 		"-object", fmt.Sprintf("memory-backend-file,id=syzcov,share=on,mem-path=%s,size=256M", *flagShmem),
 		"-device", "ivshmem-plain,memdev=syzcov",
+		// Devices so protocol method fuzzing has real targets:
+		"-device", "VGA",
+		"-netdev", "user,id=net0",
+		"-device", "virtio-net-pci,netdev=net0",
+		"-drive", fmt.Sprintf("if=none,id=disk0,format=raw,file=%s", diskPath),
+		"-device", "virtio-blk-pci,drive=disk0",
+		"-device", "qemu-xhci,id=xhci",
+		"-device", "usb-tablet,bus=xhci.0",
 	}
 	cmd := exec.CommandContext(ctx, *flagQemu, args...)
 	cmd.Stdout = nil

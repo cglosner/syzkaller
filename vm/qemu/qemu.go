@@ -287,9 +287,19 @@ var archConfigs = map[string]*archConfig{
 			// per-VM file the executor passes via EDK2_IVSHMEM.
 			"-object memory-backend-file,id=syzcov,share=on,mem-path={{TEMPLATE}}/syz-edk2.shm,size=256M",
 			"-device ivshmem-plain,memdev=syzcov",
+			// Devices so protocol method fuzzing has real targets:
+			// VGA for GOP (GraphicsOutput protocol)
+			"-device VGA",
+			// virtio-net for SNP/MNP/IP4/TCP4/UDP4/ARP
+			"-netdev user,id=net0",
+			"-device virtio-net-pci,netdev=net0",
+			// virtio-blk for BlockIo/DiskIo
+			"-drive if=none,id=disk0,format=raw,file={{TEMPLATE}}/fuzz-disk.img",
+			"-device virtio-blk-pci,drive=disk0",
+			// USB xHCI controller + emulated tablet for UsbIo
+			"-device qemu-xhci,id=xhci",
+			"-device usb-tablet,bus=xhci.0",
 		}, " "),
-		// Empty NetDev/RngDev — firmware has no network stack that needs them
-		// and the default -serial stdio from buildQemuArgs is sufficient.
 	},
 }
 
@@ -476,8 +486,15 @@ func (inst *instance) boot() error {
 	// The file must exist and be the right size (256 MiB). We zero it
 	// on each boot so the asan shadow window starts clean.
 	if inst.target.OS == targets.EDK2 {
-		shmPath := filepath.Join(inst.workdir, "template", "syz-edk2.shm")
-		os.MkdirAll(filepath.Dir(shmPath), 0755)
+		templateDir := filepath.Join(inst.workdir, "template")
+		os.MkdirAll(templateDir, 0755)
+		// Create a small fuzz disk image for BlockIo/DiskIo testing.
+		diskPath := filepath.Join(templateDir, "fuzz-disk.img")
+		if df, err := os.Create(diskPath); err == nil {
+			df.Truncate(64 << 20) // 64 MiB raw disk
+			df.Close()
+		}
+		shmPath := filepath.Join(templateDir, "syz-edk2.shm")
 		os.Remove(shmPath)
 		f, err := os.Create(shmPath)
 		if err != nil {

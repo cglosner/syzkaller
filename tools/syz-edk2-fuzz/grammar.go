@@ -90,14 +90,14 @@ func (gt *grammarTarget) generateGrammarProgram(rng *rand.Rand) (*program, error
 		if call.Meta.Name != "syz_edk2_run_program" {
 			continue
 		}
-		return walkSyzEdk2RunProgram(call)
+		return walkSyzEdk2RunProgram(call, p)
 	}
 	return nil, fmt.Errorf("prog.Generate did not pick syz_edk2_run_program")
 }
 
 // walkSyzEdk2RunProgram extracts the inner edk2_program from a
 // syz_edk2_run_program *prog.Call and converts it to wire format.
-func walkSyzEdk2RunProgram(call *prog.Call) (*program, error) {
+func walkSyzEdk2RunProgram(call *prog.Call, p *prog.Prog) (*program, error) {
 	if len(call.Args) < 1 {
 		return nil, fmt.Errorf("syz_edk2_run_program: no args")
 	}
@@ -148,7 +148,11 @@ func walkSyzEdk2RunProgram(call *prog.Call) (*program, error) {
 	if numCalls == 0 {
 		return nil, fmt.Errorf("no translatable variants in edk2_program")
 	}
-	return &program{NumCalls: numCalls, Wire: buf.Bytes()}, nil
+	syzText := ""
+	if flagSyzProg != nil && *flagSyzProg {
+		syzText = string(p.Serialize())
+	}
+	return &program{NumCalls: numCalls, Wire: buf.Bytes(), SyzProg: syzText}, nil
 }
 
 // emitUnionVariant translates one syz_edk2_call union variant into a

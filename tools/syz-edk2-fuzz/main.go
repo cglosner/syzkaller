@@ -96,6 +96,8 @@ var (
 	flagUseGrammar  = flag.Bool("use-grammar", false, "use the syzkaller prog package + sys/edk2 syzlang descriptions to generate programs (real grammar) instead of the hand-rolled random emitter")
 	flagDumpFirst   = flag.Bool("dump-first", false, "dump the first generated program to stderr (debug)")
 	flagGrammarSkip = flag.String("grammar-skip", "", "comma-separated list of API ids to drop from grammar-generated programs (debug)")
+	flagProgLog     = flag.String("prog-log", "", "if set, write each program's call IDs to this file (one line per program, crash-triggering programs marked with CRASH)")
+	flagSyzProg     = flag.Bool("syz-prog", false, "also dump the syzlang serialized form of each grammar program to the prog log")
 )
 
 type stats struct {
@@ -202,6 +204,18 @@ func main() {
 	rng := rand.New(rand.NewSource(*flagSeed))
 	pcSet := make(map[uint64]struct{})
 
+	// Program log — write each program's call IDs + result so the
+	// user can see what was sent and correlate with crashes.
+	var progLog *os.File
+	if *flagProgLog != "" {
+		var err error
+		progLog, err = os.Create(*flagProgLog)
+		if err != nil {
+			fail("create prog log: %v", err)
+		}
+		defer progLog.Close()
+	}
+
 	var gt *grammarTarget
 	if *flagUseGrammar {
 		var gerr error
@@ -298,6 +312,22 @@ func main() {
 		st.Programs.Add(1)
 		progsThisVM++
 		st.Calls.Add(uint64(prog.NumCalls))
+
+		// Build a human-readable call-ID summary for the program log.
+		var callIDs []uint32
+		{
+			off := 0
+			for i := 0; i < prog.NumCalls && off+8 <= len(prog.Wire); i++ {
+				cid := binary.LittleEndian.Uint32(prog.Wire[off:])
+				csz := binary.LittleEndian.Uint32(prog.Wire[off+4:])
+				callIDs = append(callIDs, cid)
+				if csz < 8 || off+int(csz) > len(prog.Wire) {
+					break
+				}
+				off += int(csz)
+			}
+		}
+
 		// Reset cover ring on each iteration so we get a per-program count.
 		writeU32(shmem.Data, edk2OffCoverCount, 0)
 		ok := pokeAgent(shmem.Data, prog, *flagPokeTimeout)
@@ -310,6 +340,11 @@ func main() {
 					st.Programs.Load(), prog.NumCalls, len(prog.Wire),
 					readU32(shmem.Data, edk2OffHostSeq),
 					readU32(shmem.Data, edk2OffGuestSeq))
+			}
+			// Log timed-out programs too
+			if progLog != nil {
+				fmt.Fprintf(progLog, "TIMEOUT prog=%d calls=%v\n",
+					st.Programs.Load(), callIDs)
 			}
 			continue
 		}
@@ -324,6 +359,16 @@ func main() {
 		if *flagVerbose {
 			fmt.Fprintf(os.Stderr, "[poke %d] ncalls=%d status=%d cov=%d\n",
 				st.Programs.Load(), prog.NumCalls, status, len(pcSet))
+		}
+
+		// Write to program log.
+		if progLog != nil {
+			fmt.Fprintf(progLog, "prog=%d status=%d cov=%d calls=%v",
+				st.Programs.Load(), status, len(pcSet), callIDs)
+			if prog.SyzProg != "" && *flagSyzProg {
+				fmt.Fprintf(progLog, " syz=%q", prog.SyzProg)
+			}
+			fmt.Fprintf(progLog, "\n")
 		}
 	}
 	st.UniqueCovPCs.Store(uint64(len(pcSet)))
@@ -359,6 +404,7 @@ func main() {
 type program struct {
 	NumCalls int
 	Wire     []byte
+	SyzProg  string // syzlang serialized form (only if -syz-prog is set)
 }
 
 // generateProgram emits a packed program in the SyzAgent wire format.

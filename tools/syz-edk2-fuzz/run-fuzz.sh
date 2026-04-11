@@ -156,6 +156,8 @@ run_fuzz() {
         -seed "${SEED}" \
         -snapshot-every "${SNAPSHOT_EVERY}" \
         -call-set "${CALL_SET}" \
+        -prog-log "${WORKDIR}/programs.log" \
+        -syz-prog \
         "${extra[@]}" \
         > "${SUMMARY}" 2> "${WORKDIR}/fuzz-stderr.log"
 }

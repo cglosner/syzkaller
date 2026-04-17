@@ -1,0 +1,10 @@
+TITLE: edk2: X64 exception 0D in PcRtc
+
+ConvertPages: range 7F400000 - 7F7FFFFF covers multiple entries
+[SYZ-AGENT] dispatching call 230 (GetTime)
+!!!! X64 Exception Type - 0D(#GP - General-Protection)  CPU Apic ID - 00000000 !!!!
+ExceptionData - 0000000000000000
+RIP  - 000000003E8C1234, CS  - 0000000000000038, RFLAGS - 0000000000010246
+RAX  - 0000000000000000, RCX - 0000000000000000, RDX - 000000003E8C1000
+RBX  - 0000000000000000, RSP - 000000007FFCFDA0, RBP - 000000007FFCFDB0
+!!!! Find image based on IP(0x3E8C1234) /tmp/PcRtc.dll (ImageBase=0x3E8C0000) !!!!

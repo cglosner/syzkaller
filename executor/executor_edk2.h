@@ -56,20 +56,16 @@ static void cover_enable(cover_t* cov, bool collect_comps, bool extra)
 {
 }
 
-static bool edk2_first_reset = true;
-
 static void cover_reset(cover_t* cov)
 {
 	cov->size = 0;
-	// Reset the firmware-side cover ring so we get per-call PCs.
-	// Skip the first reset so the boot-time PCs from SyzCoverLib
-	// stay in the ring — they provide initial coverage diversity
-	// that helps the manager discover syz_edk2_run_program is
-	// interesting and add it to the corpus.
-	if (syz_edk2_chan.base != NULL && !edk2_first_reset) {
+	// The firmware-side SyzCoverReset (called by the agent before
+	// dispatch) zeros the ring count AND enables the coverage gate.
+	// Background DXE activity won't write PCs while the gate is off.
+	// We still zero from the host side as a safety measure.
+	if (syz_edk2_chan.base != NULL) {
 		*(volatile uint32*)(syz_edk2_chan.base + EDK2_OFF_COVER) = 0;
 	}
-	edk2_first_reset = false;
 }
 
 static void cover_collect(cover_t* cov)
@@ -77,6 +73,51 @@ static void cover_collect(cover_t* cov)
 	cov->size = 0;
 	uint64* dst = (uint64*)(cov->data + cov->data_offset);
 	uint32 max_pcs = (uint32)((cov->data_end - (char*)dst) / sizeof(uint64));
+
+	// Comparison mode: instead of writing PCs, populate the cov->data
+	// buffer with the kcov_comparison_t format so write_comparisons()
+	// in executor.cc can read it. The firmware-side __sanitizer_cov_trace_cmp*
+	// handlers write (type, pc, arg1, arg2) quadruples to the comps ring
+	// at EDK2_OFF_COMPS. We translate into the host's expected layout:
+	//   uint64 ncomps; { uint64 type; uint64 arg1; uint64 arg2; uint64 pc; }*
+	if (flag_comparisons) {
+		uint64* hdr = dst;
+		hdr[0] = 0;
+		cov->size = 1; // 1 uint64 header by default
+		if (syz_edk2_chan.base == NULL)
+			return;
+		volatile uint8* base = syz_edk2_chan.base;
+		volatile uint32* cmp_count_ptr = (volatile uint32*)(base + EDK2_OFF_COMPS);
+		uint32 ncomps = *cmp_count_ptr;
+		if (ncomps == 0)
+			return;
+		if (ncomps > 512)
+			ncomps = 512; // EDK2_COMPS_MAX
+		// Each kcov_comparison_t is 4 uint64. After the 1-uint64 header,
+		// we need 4*ncomps more uint64s.
+		uint32 max_entries = (max_pcs - 1) / 4;
+		if (ncomps > max_entries)
+			ncomps = max_entries;
+		hdr[0] = ncomps;
+
+		volatile uint64* src = (volatile uint64*)(base + EDK2_OFF_COMPS + sizeof(uint32));
+		for (uint32 i = 0; i < ncomps; i++) {
+			// Source layout: type, pc, arg1, arg2
+			uint64 type = src[i * 4 + 0];
+			uint64 pc = src[i * 4 + 1];
+			uint64 arg1 = src[i * 4 + 2];
+			uint64 arg2 = src[i * 4 + 3];
+			// Dest layout (kcov_comparison_t): type, arg1, arg2, pc
+			dst[1 + i * 4 + 0] = type;
+			dst[1 + i * 4 + 1] = arg1;
+			dst[1 + i * 4 + 2] = arg2;
+			dst[1 + i * 4 + 3] = pc;
+		}
+		cov->size = 1 + ncomps * 4;
+		// Reset for next program.
+		*cmp_count_ptr = 0;
+		return;
+	}
 
 	// Always include a synthetic PC so the manager's coverage probe
 	// sees at least 1 PC even for syz_mmap-only programs that don't
@@ -90,20 +131,31 @@ static void cover_collect(cover_t* cov)
 	if (syz_edk2_chan.base == NULL)
 		return;
 
-	// Read the PC count and PCs from the ivshmem cover ring.
+	// Read PCs from the cover ring. With the firmware-side gate
+	// (SyzCoverReset enables, SyzCoverStop disables), these are only
+	// PCs hit during program dispatch — not background DXE activity.
 	volatile uint8* base = syz_edk2_chan.base;
-	uint32 nr_pcs = *(volatile uint32*)(base + EDK2_OFF_COVER);
+	volatile uint32* count_ptr = (volatile uint32*)(base + EDK2_OFF_COVER);
+	uint32 nr_pcs = *count_ptr;
 	if (nr_pcs == 0)
 		return;
-	if (nr_pcs > 0x10000)
-		nr_pcs = 0x10000;
+	// Cap at 16K PCs per call. A single firmware dispatch typically
+	// produces 1-10K unique PCs. Values much higher than this indicate
+	// stale boot PCs leaking through (the gate may not be effective
+	// for all modules). Capping prevents pollution of max_signal.
+	if (nr_pcs > 0x4000)
+		nr_pcs = 0x4000;
 	if (nr_pcs + 1 > max_pcs)
 		nr_pcs = max_pcs - 1;
 
 	volatile uint64* src = (volatile uint64*)(base + EDK2_OFF_COVER + sizeof(uint32));
 	for (uint32 i = 0; i < nr_pcs; i++)
-		dst[i + 1] = src[i]; // +1 to skip the synthetic PC at [0]
+		dst[i + 1] = src[i];
 	cov->size = nr_pcs + 1;
+
+	// Zero the count after reading to prevent re-reading stale PCs
+	// if cover_collect is called again before the next cover_reset.
+	*count_ptr = 0;
 }
 
 static void cover_protect(cover_t* cov)

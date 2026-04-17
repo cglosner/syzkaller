@@ -121,9 +121,13 @@ type triageCall struct {
 // of runs for the additional work. With 2/6 criteria, a program with 60% flakiness has
 // 96% chance to be kept in the corpus after retriage.
 const (
-	deflakeNeedRuns         = 3
+	// Reduced from 3 to 1: edk2 firmware coverage is deterministic
+	// (no KASLR) but can appear flaky due to firmware timer interrupts
+	// between cover gate enable and dispatch. With needRuns=1, any
+	// signal from the first run is accepted as stable.
+	deflakeNeedRuns         = 1
 	deflakeMaxRuns          = 5
-	deflakeNeedCorpusRuns   = 2
+	deflakeNeedCorpusRuns   = 1
 	deflakeMinCorpusRuns    = 4
 	deflakeMaxCorpusRuns    = 6
 	deflakeTotalCorpusRuns  = 20
@@ -150,6 +154,13 @@ func (job *triageJob) run(fuzzer *Fuzzer) {
 	if stop {
 		return
 	}
+	// Best-effort cover collection for /cover visualization. deflake
+	// may have returned early (e.g., needRuns=1 accepts signal from the
+	// initial fuzzing run without any triage exec), leaving info.cover
+	// empty. Run one extra exec with ExecFlagCollectCover so the corpus
+	// entry has real cover for the web UI. A crash or hang here is
+	// tolerable — we just keep whatever cover we already have.
+	job.collectCover()
 	var wg sync.WaitGroup
 	for call, info := range job.calls {
 		wg.Add(1)
@@ -159,6 +170,55 @@ func (job *triageJob) run(fuzzer *Fuzzer) {
 		}()
 	}
 	wg.Wait()
+}
+
+// collectCover runs one best-effort exec() with ExecFlagCollectCover to
+// populate info.cover for each call. The result is discarded on failure
+// (Stop/Crashed/Hanged) — we prefer to still add the entry to the corpus
+// with empty cover over dropping it entirely. For targets where deflake
+// already runs exec() with cover (needRuns >= 2), this is redundant but
+// harmless: info.cover.Merge is idempotent on the same PC set.
+func (job *triageJob) collectCover() {
+	indices := make([]int, 0, len(job.calls))
+	for call := range job.calls {
+		indices = append(indices, call)
+	}
+	result := job.execute(&queue.Request{
+		Prog:            job.p,
+		ExecOpts:        setFlags(flatrpc.ExecFlagCollectCover | flatrpc.ExecFlagCollectSignal),
+		ReturnAllSignal: indices,
+		Stat:            job.fuzzer.statExecTriage,
+	}, progInTriage)
+	if result.Stop() || result.Info == nil {
+		return
+	}
+	mergeCall := func(call int, res *flatrpc.CallInfo) {
+		info := job.calls[call]
+		if info == nil || res == nil {
+			return
+		}
+		// Drop the edk2 synthetic probe PC (0xFFE00000). It's a sentinel
+		// the executor always prepends so the coverage feature probe
+		// sees a non-empty buffer; it has no matching coverage callback
+		// site so the /cover symbolizer rejects any profile containing
+		// it unless ?force=1 is used. Filter here (not in convertCallInfo)
+		// so the probe path still sees it.
+		cover := res.Cover
+		if len(cover) > 0 {
+			filtered := cover[:0:len(cover)]
+			for _, pc := range cover {
+				if pc != 0xffe00000 {
+					filtered = append(filtered, pc)
+				}
+			}
+			cover = filtered
+		}
+		info.cover.Merge(cover)
+	}
+	for i, callInfo := range result.Info.Calls {
+		mergeCall(i, callInfo)
+	}
+	mergeCall(-1, result.Info.Extra)
 }
 
 func (job *triageJob) handleCall(call int, info *triageCall) {

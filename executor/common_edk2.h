@@ -59,6 +59,13 @@ static long syz_mmap(volatile long a0, volatile long a1)
 #define EDK2_OFF_GUEST_SEQ 0x1004
 #define EDK2_OFF_GUEST_STATUS 0x1008
 #define EDK2_OFF_COVER 0x2000
+// Comparison ring written by SyzCoverLib's __sanitizer_cov_trace_cmp*
+// handlers when the firmware is built with -fsanitize-coverage=trace-cmp.
+// Layout: uint32 count, then count entries of 4*uint64 = (type, pc, arg1, arg2).
+#define EDK2_OFF_COMPS 0x80000
+#define EDK2_COMPS_MAX 512
+#define EDK2_CMP_SIZE_MASK 0x7
+#define EDK2_CMP_CONST     0x8
 
 #define EDK2_PROG_BYTES (EDK2_OFF_HOST_SEQ - EDK2_OFF_CALLS)
 #define EDK2_TIMEOUT_MS 5000
@@ -70,6 +77,7 @@ static long syz_mmap(volatile long a0, volatile long a1)
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/shm.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -82,6 +90,241 @@ struct syz_edk2_channel {
 };
 
 static struct syz_edk2_channel syz_edk2_chan;
+
+// -----------------------------------------------------------------
+// TcgSnapshot / fwsnap fast path.
+//
+// When vm/qemu.go launches qemu with the libfwsnap.so plugin attached,
+// it publishes two extra env vars:
+//
+//   EDK2_FWSNAP_SHMID      SysV shmem id of the fwsnap control region
+//   EDK2_FWSNAP_INPUT_ADDR guest physical address of the firmware-side
+//                         gSyzFwfuzzInputBuffer (from the SYZFWFUZZ
+//                         debug marker at discovery time)
+//   EDK2_FWSNAP_FUZZ_MAX   size of the fuzz_input buffer in bytes
+//
+// In this mode, each syz_edk2_run_program:
+//   1. writes the program into the fwsnap control shmem's fuzz_input
+//      area and publishes fuzz_input_addr / fuzz_input_len
+//   2. zeros the ivshmem cover count
+//   3. writes command=FWSNAP_CMD_RESTORE and waits for it to be acked
+//      (the plugin zeros the command byte after picking it up)
+//   4. waits for status == FWSNAP_STATUS_DONE
+//
+// Coverage collection is unchanged: SyzCoverLib writes PCs to the
+// cover ring in the ivshmem BAR, which is NOT rolled back by the
+// snapshot (the snapshot region covers 0x3c000000:0x04000000 of DRAM
+// plus, if ASan is active, the shadow BAR — never the SyzCoverLib
+// ring itself). cover_collect reads the ring as before.
+//
+// The doorbell path (EDK2_FWSNAP_SHMID unset) still works as a
+// fallback, so non-snapshot edk2 VMs continue to function unchanged.
+// -----------------------------------------------------------------
+
+#define FWSNAP_OFF_COMMAND        0
+#define FWSNAP_OFF_STATUS         1
+#define FWSNAP_OFF_FUZZ_INPUT_ADR 8
+#define FWSNAP_OFF_FUZZ_INPUT_LEN 16
+#define FWSNAP_OFF_SHADOW_BASE    40
+#define FWSNAP_OFF_SHADOW_SIZE    48
+#define FWSNAP_OFF_FUZZ_DATA      64
+
+#define FWSNAP_CMD_NOP     0
+#define FWSNAP_CMD_RESTORE 1
+// FWSNAP_CMD_RERUN: re-enter the trigger without restoring saved
+// memory regions. Only CPU registers (RIP, RSP, etc.) are rolled back
+// to their trigger-entry snapshot values, so SyzFwfuzzTrigger re-runs
+// cleanly against an UNCHANGED firmware heap/global state. Used for
+// subsequent protocol calls within the same fuzzer program, so state
+// (allocation table slots, event handles, file handles, ...) persists
+// across variant syscalls and resource chains actually work.
+// The first call of each program still uses FWSNAP_CMD_RESTORE.
+#define FWSNAP_CMD_RERUN   4
+
+#define FWSNAP_STATUS_RESTORED 3
+#define FWSNAP_STATUS_DONE     4
+
+struct syz_edk2_fwsnap {
+	uint8* base;
+	size_t size;
+	uint64 fuzz_input_addr;
+	size_t fuzz_max;
+	int attached;
+	// program_started tracks whether we've sent RESTORE for the
+	// current fuzzer program yet. Reset by syz_edk2_fwsnap_program_reset
+	// at the top of execute_one (see executor.cc). Without this, every
+	// protocol call would roll firmware state back to the snapshot and
+	// cross-call state chaining would be impossible.
+	int program_started;
+	// Per-program slot counters that mirror SyzAgentDxe's deterministic
+	// slot allocator. The agent picks the lowest empty slot for each
+	// producer call; with CMD_RERUN preserving state across calls,
+	// the Nth producer call of a given kind hits slot N-1. We use these
+	// counters as the return value of syz_edk2_run_program to populate
+	// syzkaller resources (edk2_alloc_slot, edk2_event_slot, ...) with
+	// values that match actual firmware slots, so consumer variants
+	// ($free_pool, $close_event, ...) get a live slot as input.
+	//
+	// This is only approximate — a $free_pool in the middle of a
+	// program would empty a slot that the next $allocate_pool would
+	// re-fill, creating a discrepancy between our counter and the
+	// firmware's real slot. The mutator still benefits from a linked
+	// producer/consumer contract even when the value is imperfect.
+	int alloc_counter;
+	int event_counter;
+	int file_counter;
+	int image_counter;
+};
+
+static struct syz_edk2_fwsnap syz_edk2_fws;
+
+static void syz_edk2_fwsnap_program_reset(void)
+{
+	syz_edk2_fws.program_started = 0;
+	syz_edk2_fws.alloc_counter = 0;
+	syz_edk2_fws.event_counter = 0;
+	syz_edk2_fws.file_counter = 0;
+	syz_edk2_fws.image_counter = 0;
+}
+
+static int syz_edk2_attach_fwsnap(struct syz_edk2_fwsnap* fws)
+{
+	if (fws->attached)
+		return 0;
+	const char* shmid_s = getenv("EDK2_FWSNAP_SHMID");
+	const char* addr_s = getenv("EDK2_FWSNAP_INPUT_ADDR");
+	const char* fmax_s = getenv("EDK2_FWSNAP_FUZZ_MAX");
+	if (!shmid_s || !*shmid_s || !addr_s || !*addr_s || !fmax_s || !*fmax_s) {
+		fws->attached = -1; // decided: NOT snapshot mode
+		return -1;
+	}
+	int shmid = atoi(shmid_s);
+	void* p = shmat(shmid, NULL, 0);
+	if (p == (void*)-1) {
+		debug("syz_edk2_fwsnap: shmat(%d) failed: %s\n",
+		      shmid, strerror(errno));
+		fws->attached = -1;
+		return -1;
+	}
+	fws->base = (uint8*)p;
+	fws->fuzz_max = (size_t)strtoul(fmax_s, NULL, 0);
+	fws->size = 64 + fws->fuzz_max; // header + data area
+	fws->fuzz_input_addr = strtoull(addr_s, NULL, 0);
+	fws->attached = 1;
+	debug("syz_edk2_fwsnap: attached shmid=%d input_addr=0x%lx fuzz_max=%zu\n",
+	      shmid, (unsigned long)fws->fuzz_input_addr, fws->fuzz_max);
+	return 0;
+}
+
+// Returns 1 if fwsnap mode is active, 0 if doorbell mode, -1 on error.
+static int syz_edk2_fwsnap_mode(void)
+{
+	if (syz_edk2_fws.attached == 0) {
+		syz_edk2_attach_fwsnap(&syz_edk2_fws);
+	}
+	return syz_edk2_fws.attached > 0 ? 1 : 0;
+}
+
+// Submit a program via the fwsnap RESTORE path. prog points at the
+// wire-format program (magic + ncalls + call records). bytes is the
+// length of the program excluding the 8-byte header-slot that
+// syz_edk2_run_program wants to prepend — we re-add it from the
+// prog data itself.
+static int syz_edk2_fwsnap_run(const uint8* prog, size_t bytes)
+{
+	struct syz_edk2_fwsnap* fws = &syz_edk2_fws;
+	if (!fws->attached || fws->base == NULL) {
+		errno = ENODEV;
+		return -1;
+	}
+	if (bytes > fws->fuzz_max) {
+		errno = EMSGSIZE;
+		return -1;
+	}
+	// Copy program into the fuzz_input_data area (after the 64-byte
+	// control header).
+	memcpy(fws->base + FWSNAP_OFF_FUZZ_DATA, prog, bytes);
+	// Tell the plugin where to inject the input in the guest (the
+	// SyzFwfuzzInputBuffer physical address from discovery) and
+	// how many bytes to copy.
+	*(volatile uint64*)(fws->base + FWSNAP_OFF_FUZZ_INPUT_ADR) =
+	    fws->fuzz_input_addr;
+	*(volatile uint64*)(fws->base + FWSNAP_OFF_FUZZ_INPUT_LEN) =
+	    (uint64)bytes;
+	// Zero the cover ring before we trigger so we only read this
+	// iteration's PCs. Mirror cover_reset().
+	if (syz_edk2_chan.base != NULL) {
+		*(volatile uint32*)(syz_edk2_chan.base + EDK2_OFF_COVER) = 0;
+	}
+	// Pick the right command for this iteration:
+	//   - FWSNAP_CMD_RESTORE on the first protocol call of a fuzzer
+	//     program: roll back all saved memory regions (pristine
+	//     firmware state).
+	//   - FWSNAP_CMD_RERUN on subsequent protocol calls of the same
+	//     program: preserve firmware memory (heap, globals, agent
+	//     allocation table, event table, ...) so cross-call state
+	//     chains work. Only CPU registers roll back, re-entering
+	//     SyzFwfuzzTrigger cleanly.
+	// program_started is cleared in syz_edk2_fwsnap_program_reset,
+	// which executor.cc calls at the top of execute_one per program.
+	//
+	// Two-phase protocol (unchanged from RESTORE-only): status is
+	// already DONE from the previous iteration, so we must wait for
+	// it to transition OUT of DONE (do_restore / do_rerun sets it to
+	// RESTORED) before waiting for it to come BACK to DONE. Otherwise
+	// the stale DONE short-circuits and the iteration never actually
+	// ran — empty cover ring, stale ASan shadow, etc.
+	uint8 run_cmd = fws->program_started ? FWSNAP_CMD_RERUN : FWSNAP_CMD_RESTORE;
+	fws->program_started = 1;
+	__atomic_store_n((volatile uint8*)(fws->base + FWSNAP_OFF_COMMAND),
+			 run_cmd, __ATOMIC_RELEASE);
+	struct timespec start, now;
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	// Phase A: wait for the plugin to pick up the RESTORE command
+	// AND execute do_restore (which sets status=RESTORED). This is
+	// where we detect that the new iteration has actually started.
+	for (;;) {
+		uint8 st = __atomic_load_n(
+		    (volatile uint8*)(fws->base + FWSNAP_OFF_STATUS),
+		    __ATOMIC_ACQUIRE);
+		uint8 cmd = __atomic_load_n(
+		    (volatile uint8*)(fws->base + FWSNAP_OFF_COMMAND),
+		    __ATOMIC_ACQUIRE);
+		// Success: status has transitioned out of DONE into
+		// RESTORED (or later), AND the plugin has acked the
+		// command (written NOP back).
+		if (cmd == FWSNAP_CMD_NOP && st != FWSNAP_STATUS_DONE)
+			break;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000 +
+				  (now.tv_nsec - start.tv_nsec) / 1000000;
+		if (elapsed_ms >= EDK2_TIMEOUT_MS) {
+			errno = ETIMEDOUT;
+			return -1;
+		}
+		struct timespec ts = {0, 100 * 1000};
+		nanosleep(&ts, NULL);
+	}
+	// Phase B: wait for status=DONE. The iteration ran the guest
+	// body and hit the exit_trigger PC.
+	for (;;) {
+		uint8 st = __atomic_load_n(
+		    (volatile uint8*)(fws->base + FWSNAP_OFF_STATUS),
+		    __ATOMIC_ACQUIRE);
+		if (st == FWSNAP_STATUS_DONE)
+			break;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000 +
+				  (now.tv_nsec - start.tv_nsec) / 1000000;
+		if (elapsed_ms >= EDK2_TIMEOUT_MS) {
+			errno = ETIMEDOUT;
+			return -1;
+		}
+		struct timespec ts = {0, 100 * 1000};
+		nanosleep(&ts, NULL);
+	}
+	return 0;
+}
 
 static int syz_edk2_open_channel(struct syz_edk2_channel* ch)
 {
@@ -137,6 +380,45 @@ static long syz_edk2_run_program(volatile long a0)
 	if (ncalls == 0 || ncalls > 32) {
 		errno = EINVAL;
 		return -1;
+	}
+	// TcgSnapshot fast path: if the executor env carries a valid
+	// EDK2_FWSNAP_SHMID, submit via the plugin's RESTORE protocol
+	// instead of the doorbell. Coverage still comes from the
+	// ivshmem cover ring (SyzCoverLib writes PCs into the BAR,
+	// which is OUTSIDE the snapshot region so it survives the
+	// memory rollback and the host can drain it each iteration).
+	if (syz_edk2_fwsnap_mode() == 1) {
+		long res = syz_edk2_fwsnap_run(prog, EDK2_PROG_BYTES);
+		if (res < 0) {
+			return res;
+		}
+		// Return a slot value consistent with SyzAgentDxe's
+		// deterministic allocator so syzkaller resource chains
+		// (allocate→free, create_event→close_event, ...) can line
+		// up producer and consumer calls without firmware write-back.
+		// We look at the FIRST call's id in the program (variants
+		// always send 1-call programs), pick the matching counter,
+		// and return its pre-increment value.
+		if (ncalls >= 1) {
+			const uint8* call_hdr = prog + EDK2_OFF_CALLS;
+			uint32 call_id = *(const uint32*)call_hdr;
+			struct syz_edk2_fwsnap* fws = &syz_edk2_fws;
+			switch (call_id) {
+			case 200: // AllocatePool
+			case 202: // AllocatePages
+				return fws->alloc_counter++;
+			case 250: // CreateEvent
+				return fws->event_counter++;
+			case 700: // SimpleFsOpenVolume
+			case 701: // FileOpen
+				return fws->file_counter++;
+			case 790: // LoadImage
+				return fws->image_counter++;
+			default:
+				return 0;
+			}
+		}
+		return 0;
 	}
 	// Copy header + raw call records into the shared region. We trust
 	// the prog package to have produced something the agent can parse;

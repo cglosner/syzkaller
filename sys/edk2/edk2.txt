@@ -28,12 +28,56 @@ meta arches["amd64"]
 # the Linux host (HostFuzzer mode); see executor_edk2.h.
 syz_mmap(addr vma, len len[addr])
 
+# ----------------------------------------------------------------------
+# Agent-side slot index resources. Each is a small integer indexing a
+# fixed-size table inside SyzAgentDxe (`gSyzEdk2Agent.Allocs[]`,
+# `.Events[]`, `.Files[]`, `.Images[]`). The agent picks the lowest
+# empty slot when a producer call (allocate_pool, create_event,
+# file_open, load_image) runs; consumer calls (free_pool, signal_event,
+# file_read, start_image, ...) take the same index.
+#
+# By declaring these as resources the mutator learns the producer/
+# consumer contract — it's much more likely to pick an index that
+# actually matches a live slot, which drives the consumer past
+# SyzAgentDispatch.c's "Kind != expected" early-return and into the
+# instrumented gBS/gRT/protocol code. Slot assignment is deterministic
+# (lowest empty first), so small default-value sets cover the common
+# alloc-order patterns without any firmware write-back.
+#
+# Resources are program-scoped: with FWSNAP_CMD_RERUN preserving
+# firmware state across variant calls within one syzkaller program,
+# an index allocated by call #1 is still valid for call #2.
+resource edk2_alloc_slot[int32]: 0, 1, 2, 3, 4, 5, 6, 7, 8, 15, 31
+resource edk2_event_slot[int32]: 0, 1, 2, 3, 4, 5, 6, 7, 15
+resource edk2_file_slot[int32]: 0, 1, 2, 3, 4, 5, 6, 7
+resource edk2_image_slot[int32]: 0, 1, 2, 3, 4, 5, 6, 7
+
 syz_edk2_run_program(prog ptr[in, edk2_program])
 
 edk2_program {
 	magic	const[EDK2_PROGRAM_MAGIC, int32]
 	ncalls	len[calls, int32]
 	calls	array[syz_edk2_call, 1:32]
+} [packed]
+
+# Single-call envelope used by the protocol-level variants of
+# syz_edk2_run_program (syz_edk2_run_program$<protocol>). Each variant
+# sends exactly one tagged command through the fwsnap trigger, so the
+# fuzzer gets per-protocol granularity in stats/triage/minimize/splice
+# instead of the opaque "one syz_edk2_run_program" the multi-call
+# envelope collapses everything into. The C implementation is shared
+# with the base syz_edk2_run_program — the variant names only affect
+# the prog layer.
+type edk2_prog1[NUM, PAYLOAD] {
+	magic	const[EDK2_PROGRAM_MAGIC, int32]
+	ncalls	const[1, int32]
+	call	edk2_call1[NUM, PAYLOAD]
+} [packed]
+
+type edk2_call1[NUM, PAYLOAD] {
+	id	const[NUM, int32]
+	size	bytesize[parent, int32]
+	payload	PAYLOAD
 } [packed]
 
 # Wrapper applied to every command. NUM is the SYZ_EDK2_API_* enum value;
@@ -63,6 +107,70 @@ edk2_api_set_variable {
 	data		array[int8, 0:256]
 } [packed]
 
+# Authenticated SetVariable variant — exercises the heavy
+# AuthVariableLib parsing path in VariableRuntimeDxe / VariableSmm.
+# The data payload for EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS
+# is prepended by an EFI_VARIABLE_AUTHENTICATION_2 header:
+#
+#   [EFI_TIME Timestamp] 16 bytes
+#   [WIN_CERTIFICATE_UEFI_GUID auth_info]
+#       [WIN_CERTIFICATE Hdr]       8 bytes (len, rev, cert_type)
+#       [EFI_GUID CertType]         16 bytes
+#       [UINT8 CertData[]]          pkcs7 blob
+#   [user_data...]
+#
+# The auth path: Variable.c::ProcessVariable → AuthService.c::
+# VerifyTimeBasedPayloadAndUpdate → ProcessVarWithPk → Pkcs7Verify.
+# Heavily exercises EFI_TIME validation, WIN_CERTIFICATE length
+# checks, GUID comparison, and PKCS7 ASN.1 parsing.
+# attributes = EFI_VARIABLE_NON_VOLATILE|BOOTSERVICE_ACCESS|RUNTIME_ACCESS|
+#              TIME_BASED_AUTHENTICATED_WRITE_ACCESS = 0x27
+edk2_api_set_variable_auth {
+	name_size	bytesize[name, int16]
+	attributes	const[0x27, int32]
+	data_size	bytesize[data, int16]
+	namespace	flags[edk2_variable_namespace, int32]
+	name		array[int16, 1:32]
+	data		edk2_auth_variable_data
+} [packed]
+
+edk2_auth_variable_data {
+	timestamp	edk2_efi_time
+	auth_info	edk2_win_certificate_uefi_guid
+	user_data	array[int8, 0:128]
+} [packed]
+
+# EFI_TIME (UEFI Spec 2.7 §8.3). Ranges intentionally include a few
+# invalid boundary values (month=0/13, day=32, nanosecond=1e9+1) so
+# the fuzzer exercises range checks in the auth variable timestamp
+# validation path.
+edk2_efi_time {
+	year		int16[1900:2100]
+	month		int8[0:13]
+	day		int8[0:32]
+	hour		int8[0:24]
+	minute		int8[0:60]
+	second		int8[0:60]
+	pad1		const[0, int8]
+	nanosecond	int32[0:1000000001]
+	timezone	int16[-1440:1441]
+	daylight	int8
+	pad2		const[0, int8]
+} [packed]
+
+# WIN_CERTIFICATE_UEFI_GUID — wraps a PKCS7 signed-data blob.
+# dwLength intentionally doesn't match total struct size so the
+# fuzzer hits the bounds-check paths in the auth parser.
+# wCertificateType=0x0EF1 is EFI_CERT_TYPE_PKCS7_GUID, 0x0EF2 is
+# the AMD-specific variant; both stress the type dispatch.
+edk2_win_certificate_uefi_guid {
+	dwLength		int32[0:4096]
+	wRevision		int16[0x0200:0x0201]
+	wCertificateType	int16[0x0EF1:0x0EF2]
+	cert_type		array[int8, 16]
+	cert_data		array[int8, 0:256]
+} [packed]
+
 edk2_api_get_variable {
 	name_size	bytesize[name, int16]
 	max_data	int16[0:512]
@@ -87,6 +195,31 @@ edk2_api_get_next_variable_name {
 
 edk2_variable_attrs = EFI_VARIABLE_NON_VOLATILE, EFI_VARIABLE_BOOTSERVICE_ACCESS, EFI_VARIABLE_RUNTIME_ACCESS, EFI_VARIABLE_HARDWARE_ERROR_RECORD, EFI_VARIABLE_AUTHENTICATED_WRITE_ACCESS, EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS, EFI_VARIABLE_APPEND_WRITE
 
+# SetVariable with data_size=0 deletes the variable. Exercises the
+# "is-this-a-delete" branch in Variable.c::UpdateVariable and the
+# stale-entry reclamation path. Very different code path from a
+# normal-sized set.
+edk2_api_set_variable_delete {
+	name_size	bytesize[name, int16]
+	attributes	flags[edk2_variable_attrs, int32]
+	data_size	const[0, int16]
+	namespace	flags[edk2_variable_namespace, int32]
+	name		array[int16, 1:32]
+} [packed]
+
+# SetVariable with EFI_VARIABLE_APPEND_WRITE (0x40) extends the
+# existing value. Exercises the append merge path, which is distinct
+# from overwrite and has its own bounds checks.
+# attributes = NV|BS|RT|APPEND_WRITE = 0x47
+edk2_api_set_variable_append {
+	name_size	bytesize[name, int16]
+	attributes	const[0x47, int32]
+	data_size	bytesize[data, int16]
+	namespace	flags[edk2_variable_namespace, int32]
+	name		array[int16, 1:32]
+	data		array[int8, 0:256]
+} [packed]
+
 # Symbolic names for well-known variable namespaces. The agent maps each
 # id back to the appropriate EFI_GUID via a lookup table baked into
 # SyzAgentDxe. EDK2_VAR_NS_SYZ is the default scratch namespace.
@@ -105,7 +238,7 @@ edk2_api_free_pool {
 # Index into the agent's allocation table; the agent maps it to a
 # real EFI pointer. We do not let the fuzzer hand the firmware raw
 # pointers (see docs/edk2_design.md §4.2.1).
-	alloc_index	int32[0:31]
+	alloc_index	edk2_alloc_slot
 } [packed]
 
 edk2_api_allocate_pages {
@@ -115,7 +248,7 @@ edk2_api_allocate_pages {
 } [packed]
 
 edk2_api_free_pages {
-	alloc_index	int32[0:31]
+	alloc_index	edk2_alloc_slot
 } [packed]
 
 # CopyMem / SetMem operate inside a previously-allocated agent slot,
@@ -129,7 +262,7 @@ edk2_api_copy_mem {
 } [packed]
 
 edk2_api_set_mem {
-	alloc_index	int32[0:31]
+	alloc_index	edk2_alloc_slot
 	offset		int32[0:65535]
 	length		int32[0:65536]
 	value		int8
@@ -141,7 +274,7 @@ edk2_api_set_mem {
 # CalculateCrc32 over a previously-allocated buffer. Cheap, deterministic,
 # stresses the table-driven CRC routine.
 edk2_api_calculate_crc32 {
-	alloc_index	int32[0:31]
+	alloc_index	edk2_alloc_slot
 	offset		int32[0:65535]
 	length		int32[0:65536]
 } [packed]
@@ -197,15 +330,15 @@ edk2_api_create_event {
 } [packed]
 
 edk2_api_close_event {
-	event_index	int32[0:15]
+	event_index	edk2_event_slot
 } [packed]
 
 edk2_api_signal_event {
-	event_index	int32[0:15]
+	event_index	edk2_event_slot
 } [packed]
 
 edk2_api_raise_tpl {
-	tpl	flags[edk2_tpl, int32]
+	tpl	int32[8:16]
 } [packed]
 
 edk2_event_type = EVT_TIMER, EVT_RUNTIME, EVT_NOTIFY_WAIT, EVT_NOTIFY_SIGNAL, EVT_SIGNAL_EXIT_BOOT_SERVICES, EVT_SIGNAL_VIRTUAL_ADDRESS_CHANGE
@@ -256,7 +389,7 @@ edk2_api_hii_remove_package_list {
 # raw pointers are never sent across the wire.
 # ----------------------------------------------------------------------
 edk2_api_asan_payload {
-	alloc_index	int32[0:31]
+	alloc_index	edk2_alloc_slot
 	offset		int32[0:65535]
 	length		int32[1:65536]
 	is_write	int8[0:1]
@@ -353,6 +486,819 @@ edk2_api_hii_export_package_lists {
 	dst_index	int32[0:31]
 } [packed]
 
+# ----------------------------------------------------------------------
+# Timer / Event extensions
+# ----------------------------------------------------------------------
+edk2_api_set_timer {
+	event_index	edk2_event_slot
+	type		int32[0:2]
+	trigger_time	int64[0:50000000]
+} [packed]
+
+edk2_api_wait_for_event {
+	event_index	edk2_event_slot
+	timeout		int32[0:100]
+} [packed]
+
+# ----------------------------------------------------------------------
+# DiskIo Write
+# ----------------------------------------------------------------------
+edk2_api_disk_io_write_disk {
+	media_id	int32
+	offset		int64
+	buffer_size	int32[0:65536]
+	src_index	int32[0:31]
+} [packed]
+
+# ----------------------------------------------------------------------
+# PCI extensions (writes + IO space + Root Bridge)
+# ----------------------------------------------------------------------
+edk2_api_pci_io_mem_write {
+	width		int32[0:10]
+	bar_index	int32[0:5]
+	offset		int64
+	count		int32[0:256]
+	src_index	int32[0:31]
+} [packed]
+
+edk2_api_pci_io_pci_write {
+	width		int32[0:10]
+	pci_offset	int32[0:255]
+	count		int32[0:256]
+	src_index	int32[0:31]
+} [packed]
+
+edk2_api_pci_io_io_read {
+	width		int32[0:10]
+	bar_index	int32[0:5]
+	offset		int64
+	count		int32[0:256]
+	dst_index	int32[0:31]
+} [packed]
+
+edk2_api_pci_io_io_write {
+	width		int32[0:10]
+	bar_index	int32[0:5]
+	offset		int64
+	count		int32[0:256]
+	src_index	int32[0:31]
+} [packed]
+
+edk2_api_pci_rb_io_mem_read {
+	width		int32[0:10]
+	offset		int64
+	count		int32[0:256]
+	dst_index	int32[0:31]
+} [packed]
+
+edk2_api_pci_rb_io_mem_write {
+	width		int32[0:10]
+	offset		int64
+	count		int32[0:256]
+	src_index	int32[0:31]
+} [packed]
+
+edk2_api_pci_rb_io_pci_read {
+	width		int32[0:10]
+	pci_offset	int32[0:255]
+	count		int32[0:256]
+	dst_index	int32[0:31]
+} [packed]
+
+edk2_api_pci_rb_io_pci_write {
+	width		int32[0:10]
+	pci_offset	int32[0:255]
+	count		int32[0:256]
+	src_index	int32[0:31]
+} [packed]
+
+# ----------------------------------------------------------------------
+# SNP extensions
+# ----------------------------------------------------------------------
+edk2_api_snp_receive {
+	buffer_size	int32[0:2048]
+	dst_index	int32[0:31]
+} [packed]
+
+edk2_api_snp_get_status {
+	cookie	int64
+} [packed]
+
+edk2_api_snp_initialize {
+	rx_buf_size	int32[0:65536]
+	tx_buf_size	int32[0:65536]
+} [packed]
+
+# ----------------------------------------------------------------------
+# USB Bulk Transfer
+# ----------------------------------------------------------------------
+edk2_api_usb_io_bulk_transfer {
+	endpoint_addr	int8
+	pad0		const[0, int8]
+	pad1		const[0, int16]
+	data_index	int32[0:31]
+	data_length	int32[0:4096]
+	timeout		int32[0:5000]
+} [packed]
+
+# ----------------------------------------------------------------------
+# GOP extensions
+# ----------------------------------------------------------------------
+edk2_api_gop_set_mode {
+	mode_number	int32[0:16]
+} [packed]
+
+edk2_api_gop_query_mode {
+	mode_number	int32[0:16]
+} [packed]
+
+# ----------------------------------------------------------------------
+# HII String protocol
+# ----------------------------------------------------------------------
+edk2_api_hii_new_string {
+	handle_index	int32[0:15]
+	string_size	bytesize[string, int16]
+	pad0		const[0, int16]
+	string		array[int16, 1:64]
+} [packed]
+
+edk2_api_hii_get_string {
+	handle_index	int32[0:15]
+	string_id	int32[1:256]
+	max_size	int32[0:4096]
+	dst_index	int32[0:31]
+} [packed]
+
+edk2_api_hii_set_string {
+	handle_index	int32[0:15]
+	string_id	int32[1:256]
+	string_size	bytesize[string, int16]
+	pad0		const[0, int16]
+	string		array[int16, 1:64]
+} [packed]
+
+edk2_api_hii_get_languages {
+	handle_index	int32[0:15]
+	max_size	int32[0:4096]
+	dst_index	int32[0:31]
+} [packed]
+
+# ----------------------------------------------------------------------
+# Network: IP4
+# ----------------------------------------------------------------------
+edk2_api_ip4_configure {
+	default_protocol	int8
+	accept_any_protocol	int8[0:1]
+	accept_icmp_errors	int8[0:1]
+	accept_broadcast	int8[0:1]
+	use_default_address	int8[0:1]
+	pad0			const[0, int8]
+	pad1			const[0, int16]
+	station_address		array[int8, 4]
+	subnet_mask		array[int8, 4]
+	type_of_service		int32[0:255]
+	time_to_live		int32[1:255]
+} [packed]
+
+edk2_api_ip4_transmit {
+	dst_address	array[int8, 4]
+	protocol	int8
+	pad0		const[0, int8]
+	pad1		const[0, int16]
+	data_index	int32[0:31]
+	data_length	int32[0:1500]
+} [packed]
+
+edk2_api_ip4_get_mode_data {
+	cookie	int64
+} [packed]
+
+# ----------------------------------------------------------------------
+# Network: UDP4
+# ----------------------------------------------------------------------
+edk2_api_udp4_configure {
+	accept_broadcast	int8[0:1]
+	accept_promiscuous	int8[0:1]
+	accept_any_port		int8[0:1]
+	allow_duplicate_port	int8[0:1]
+	use_default_address	int8[0:1]
+	pad0			const[0, int8]
+	pad1			const[0, int16]
+	station_address		array[int8, 4]
+	subnet_mask		array[int8, 4]
+	station_port		int16
+	remote_port		int16
+	remote_address		array[int8, 4]
+} [packed]
+
+edk2_api_udp4_transmit {
+	dst_address	array[int8, 4]
+	dst_port	int16
+	pad0		const[0, int16]
+	data_index	int32[0:31]
+	data_length	int32[0:1500]
+} [packed]
+
+edk2_api_udp4_get_mode_data {
+	cookie	int64
+} [packed]
+
+# ----------------------------------------------------------------------
+# Network: TCP4
+# ----------------------------------------------------------------------
+edk2_api_tcp4_configure {
+	use_default_address	int8[0:1]
+	pad0			const[0, int8]
+	pad1			const[0, int16]
+	station_address		array[int8, 4]
+	subnet_mask		array[int8, 4]
+	station_port		int16
+	pad2			const[0, int16]
+	remote_address		array[int8, 4]
+	remote_port		int16
+	active_flag		int8[0:1]
+	pad3			const[0, int8]
+} [packed]
+
+edk2_api_tcp4_connect {
+	cookie	int64
+} [packed]
+
+edk2_api_tcp4_transmit {
+	data_index	int32[0:31]
+	data_length	int32[0:4096]
+	push		int8[0:1]
+	urgent		int8[0:1]
+	pad0		const[0, int16]
+} [packed]
+
+edk2_api_tcp4_get_mode_data {
+	cookie	int64
+} [packed]
+
+# ----------------------------------------------------------------------
+# Network: DHCP4
+# ----------------------------------------------------------------------
+edk2_api_dhcp4_configure {
+	discover_try_count	int32[0:5]
+	request_try_count	int32[0:5]
+} [packed]
+
+edk2_api_dhcp4_start {
+	cookie	int64
+} [packed]
+
+edk2_api_dhcp4_get_mode_data {
+	cookie	int64
+} [packed]
+
+# ----------------------------------------------------------------------
+# Network: ARP
+# ----------------------------------------------------------------------
+edk2_api_arp_configure {
+	sw_address_length	int16[4:4]
+	pad0			const[0, int16]
+	retry_count		int32[0:3]
+	retry_timeout_ms	int32[0:5000]
+} [packed]
+
+edk2_api_arp_add {
+	deny_flag	int8[0:1]
+	pad0		const[0, int8]
+	pad1		const[0, int16]
+	sw_address	array[int8, 4]
+	hw_address	array[int8, 6]
+	pad2		const[0, int16]
+} [packed]
+
+edk2_api_arp_request {
+	target_sw_address	array[int8, 4]
+	dst_index		int32[0:31]
+} [packed]
+
+# ----------------------------------------------------------------------
+# Network: MNP (Managed Network)
+# ----------------------------------------------------------------------
+edk2_api_mnp_configure {
+	received_queue_timeout_ms	int32[0:5000]
+	transmit_queue_timeout_ms	int32[0:5000]
+	protocol_type_filter		int16
+	enable_unicast_receive		int8[0:1]
+	enable_multicast_receive	int8[0:1]
+	enable_broadcast_receive	int8[0:1]
+	enable_promiscuous_receive	int8[0:1]
+	flush_queues_on_reset		int8[0:1]
+	disable_background_polling	int8[0:1]
+} [packed]
+
+edk2_api_mnp_transmit {
+	data_index	int32[0:31]
+	data_length	int32[0:1514]
+	dest_addr	array[int8, 6]
+	src_addr	array[int8, 6]
+	protocol	int16
+	pad0		const[0, int16]
+} [packed]
+
+# ----------------------------------------------------------------------
+# File System
+# ----------------------------------------------------------------------
+edk2_api_simplefs_open_volume {
+	cookie	int64
+} [packed]
+
+edk2_api_file_open {
+	file_handle_index	edk2_file_slot
+	mode			flags[edk2_file_mode, int64]
+	attributes		int64
+	name_size		bytesize[name, int16]
+	pad0			const[0, int16]
+	name			array[int16, 1:32]
+} [packed]
+
+edk2_api_file_read {
+	file_handle_index	edk2_file_slot
+	buffer_size		int32[0:65536]
+	dst_index		int32[0:31]
+} [packed]
+
+edk2_api_file_write {
+	file_handle_index	edk2_file_slot
+	data_index		int32[0:31]
+	data_length		int32[0:65536]
+} [packed]
+
+edk2_api_file_get_info {
+	file_handle_index	edk2_file_slot
+	dst_index		int32[0:31]
+	buffer_size		int32[0:4096]
+} [packed]
+
+edk2_api_file_set_info {
+	file_handle_index	edk2_file_slot
+	data_index		int32[0:31]
+	data_length		int32[0:4096]
+} [packed]
+
+edk2_api_file_close {
+	file_handle_index	edk2_file_slot
+} [packed]
+
+edk2_api_file_delete {
+	file_handle_index	edk2_file_slot
+} [packed]
+
+edk2_file_mode = EFI_FILE_MODE_READ, EFI_FILE_MODE_WRITE, EFI_FILE_MODE_CREATE
+
+# ----------------------------------------------------------------------
+# Device Path
+# ----------------------------------------------------------------------
+edk2_api_device_path_from_text {
+	text_size	bytesize[text, int16]
+	pad0		const[0, int16]
+	text		array[int8, 1:128]
+} [packed]
+
+edk2_api_device_path_to_text {
+	dst_index	int32[0:31]
+	max_size	int32[0:4096]
+	display_only	int8[0:1]
+	allow_shortcuts	int8[0:1]
+	pad0		const[0, int16]
+} [packed]
+
+# ----------------------------------------------------------------------
+# Console: SimpleTextOut + SimpleTextIn
+# ----------------------------------------------------------------------
+edk2_api_text_out_output_string {
+	string_size	bytesize[string, int16]
+	pad0		const[0, int16]
+	string		array[int16, 1:64]
+} [packed]
+
+edk2_api_text_out_set_mode {
+	mode_number	int32[0:10]
+} [packed]
+
+edk2_api_text_out_set_attribute {
+	attribute	int32[0:255]
+} [packed]
+
+edk2_api_text_out_clear_screen {
+	cookie	int64
+} [packed]
+
+edk2_api_text_in_reset {
+	extended_verification	int8[0:1]
+	pad0			const[0, int8]
+	pad1			const[0, int16]
+} [packed]
+
+edk2_api_text_in_read_key_stroke {
+	cookie	int64
+} [packed]
+
+# ----------------------------------------------------------------------
+# ACPI
+# ----------------------------------------------------------------------
+edk2_api_acpi_get_table {
+	index		int32[0:64]
+	dst_index	int32[0:31]
+} [packed]
+
+edk2_api_acpi_install_table {
+	data_index	int32[0:31]
+	data_length	int32[0:4096]
+} [packed]
+
+# ----------------------------------------------------------------------
+# Network IPv6 stack
+# ----------------------------------------------------------------------
+edk2_api_ip6_configure {
+	default_protocol	int8
+	accept_any_protocol	int8[0:1]
+	accept_icmp_errors	int8[0:1]
+	accept_promiscuous	int8[0:1]
+	destination_address	array[int8, 16]
+	station_address		array[int8, 16]
+	traffic_class		int32[0:255]
+	hop_limit		int32[1:255]
+} [packed]
+
+edk2_api_ip6_transmit {
+	cookie	int64
+} [packed]
+
+edk2_api_ip6_get_mode_data {
+	cookie	int64
+} [packed]
+
+edk2_api_udp6_configure {
+	station_address		array[int8, 16]
+	station_port		int16
+	remote_port		int16
+	remote_address		array[int8, 16]
+	accept_promiscuous	int8[0:1]
+	accept_any_port		int8[0:1]
+	allow_duplicate_port	int8[0:1]
+	use_default_address	int8[0:1]
+} [packed]
+
+edk2_api_udp6_transmit {
+	cookie	int64
+} [packed]
+
+edk2_api_udp6_get_mode_data {
+	cookie	int64
+} [packed]
+
+edk2_api_tcp6_configure {
+	station_address		array[int8, 16]
+	station_port		int16
+	remote_port		int16
+	remote_address		array[int8, 16]
+	active_flag		int8[0:1]
+	pad0			const[0, int8]
+	pad1			const[0, int16]
+} [packed]
+
+edk2_api_tcp6_connect {
+	cookie	int64
+} [packed]
+
+edk2_api_tcp6_transmit {
+	cookie	int64
+} [packed]
+
+edk2_api_tcp6_get_mode_data {
+	cookie	int64
+} [packed]
+
+edk2_api_dhcp6_configure {
+	ia_type		int32[0:1]
+	option_count	int32[0:8]
+} [packed]
+
+edk2_api_dhcp6_start {
+	cookie	int64
+} [packed]
+
+edk2_api_dhcp6_get_mode_data {
+	cookie	int64
+} [packed]
+
+edk2_api_dns4_configure {
+	enable_dns_cache	int32[0:1]
+	protocol		int32[0:255]
+	station_ip		array[int8, 4]
+	subnet_mask		array[int8, 4]
+	local_port		int16
+	pad0			const[0, int16]
+} [packed]
+
+edk2_api_dns4_host_name_to_ip {
+	host_name_size	bytesize[host_name, int16]
+	pad0		const[0, int16]
+	host_name	array[int16, 1:32]
+} [packed]
+
+edk2_api_dns6_configure {
+	enable_dns_cache	int32[0:1]
+	protocol		int32[0:255]
+	station_ip		array[int8, 16]
+	local_port		int16
+	pad0			const[0, int16]
+} [packed]
+
+edk2_api_dns6_host_name_to_ip {
+	host_name_size	bytesize[host_name, int16]
+	pad0		const[0, int16]
+	host_name	array[int16, 1:32]
+} [packed]
+
+edk2_api_mtftp4_read_file {
+	filename_size	bytesize[filename, int16]
+	pad0		const[0, int16]
+	dst_index	int32[0:31]
+	dst_size	int32[0:65536]
+	filename	array[int8, 1:128]
+} [packed]
+
+edk2_api_mtftp4_get_info {
+	filename_size	bytesize[filename, int16]
+	pad0		const[0, int16]
+	filename	array[int8, 1:128]
+} [packed]
+
+# ----------------------------------------------------------------------
+# HTTP
+# ----------------------------------------------------------------------
+edk2_api_http_configure {
+	http_version	int32[0:2]
+	timeout_ms	int32[0:5000]
+	use_https	int8[0:1]
+	is_ipv6		int8[0:1]
+	local_port	int16
+	local_address	array[int8, 16]
+} [packed]
+
+edk2_api_http_request {
+	method		int32[0:8]
+	url_size	bytesize[url, int16]
+	header_count	int16[0:16]
+	data_index	int32[0:31]
+	data_length	int32[0:4096]
+	url		array[int16, 1:64]
+} [packed]
+
+edk2_api_http_response {
+	data_index	int32[0:31]
+	data_length	int32[0:4096]
+} [packed]
+
+edk2_api_http_poll {
+	cookie	int64
+} [packed]
+
+# ----------------------------------------------------------------------
+# Crypto / Security
+# ----------------------------------------------------------------------
+edk2_api_hash2_get_hash_size {
+	algorithm	int32[0:3]
+} [packed]
+
+edk2_api_hash2_hash {
+	algorithm	int32[0:3]
+	data_index	int32[0:31]
+	data_length	int32[0:65536]
+	dst_index	int32[0:31]
+} [packed]
+
+edk2_api_rng_get_info {
+	cookie	int64
+} [packed]
+
+edk2_api_rng_get_rng {
+	dst_index	int32[0:31]
+	num_bytes	int32[1:4096]
+} [packed]
+
+edk2_api_tcg2_get_capability {
+	cookie	int64
+} [packed]
+
+edk2_api_tcg2_hash_log_extend_event {
+	flags		int32
+	data_index	int32[0:31]
+	data_length	int32[0:4096]
+	event_type	int32
+	pcr_index	int32[0:23]
+} [packed]
+
+edk2_api_tcg2_submit_command {
+	data_index	int32[0:31]
+	data_length	int32[0:4096]
+	dst_index	int32[0:31]
+	dst_length	int32[0:4096]
+} [packed]
+
+edk2_api_tcg2_get_event_log {
+	event_log_format	int32[0:1]
+} [packed]
+
+edk2_api_pkcs7_verify {
+	signed_data_index	int32[0:31]
+	signed_data_length	int32[0:4096]
+	signature_index		int32[0:31]
+	signature_length	int32[0:4096]
+	in_data_index		int32[0:31]
+	in_data_length		int32[0:4096]
+} [packed]
+
+# ----------------------------------------------------------------------
+# Storage passthrough
+# ----------------------------------------------------------------------
+edk2_api_ata_passthru {
+	port			int16[0:8]
+	port_multiplier_port	int16[0:16]
+	protocol		int32[0:8]
+	cdb			array[int8, 16]
+	in_transfer_length	int32[0:4096]
+	out_transfer_length	int32[0:4096]
+	in_buffer_index		int32[0:31]
+	out_buffer_index	int32[0:31]
+} [packed]
+
+edk2_api_ata_passthru_get_next_dev {
+	port	int16[0:8]
+	pad0	const[0, int16]
+} [packed]
+
+edk2_api_ext_scsi_passthru {
+	target			array[int8, 16]
+	lun			int64
+	data_direction		int32[0:2]
+	cdb_length		int32[0:16]
+	cdb			array[int8, 16]
+	in_transfer_length	int32[0:4096]
+	out_transfer_length	int32[0:4096]
+	in_buffer_index		int32[0:31]
+	out_buffer_index	int32[0:31]
+} [packed]
+
+edk2_api_ext_scsi_get_next_device {
+	prev_target	array[int8, 16]
+} [packed]
+
+edk2_api_nvme_passthru {
+	namespace_id	int32
+	queue_type	int32[0:1]
+	opcode		int32[0:255]
+	flags		int32
+	cdw0		int32
+	cdw1		int32
+	cdw2		int32
+	cdw3		int32
+	cdw4		int32
+	cdw5		int32
+	transfer_length	int32[0:4096]
+	data_index	int32[0:31]
+} [packed]
+
+edk2_api_nvme_passthru_get_next_ns {
+	prev_namespace_id	int32
+} [packed]
+
+# ----------------------------------------------------------------------
+# Boot dispatcher
+# ----------------------------------------------------------------------
+edk2_api_load_image {
+	boot_policy	int8[0:1]
+	pad0		const[0, int8]
+	pad1		const[0, int16]
+	data_index	int32[0:31]
+	data_length	int32[0:65536]
+} [packed]
+
+edk2_api_start_image {
+	image_handle_index	edk2_image_slot
+} [packed]
+
+edk2_api_unload_image {
+	image_handle_index	edk2_image_slot
+} [packed]
+
+edk2_api_connect_controller {
+	protocol_id	flags[edk2_protocol_id, int32]
+	recursive	int8[0:1]
+	pad0		const[0, int8]
+	pad1		const[0, int16]
+} [packed]
+
+edk2_api_disconnect_controller {
+	protocol_id	flags[edk2_protocol_id, int32]
+} [packed]
+
+# ----------------------------------------------------------------------
+# Hardware-level primitives (800-819) + SMI callouts.
+#
+# These let the fuzzer poke real hardware through EDK2's abstraction
+# layer. Historically very bug-rich: SMI handlers with bad pointer
+# checks, CpuIo2Protocol implementations that forget to validate
+# width, MSR writes that trigger #GP or corrupt CPU state.
+# ----------------------------------------------------------------------
+
+# SW-SMI via ICH9 software SMI port (0xB2) + data port (0xB3).
+# The command byte dispatches to registered SMI handlers via the
+# PiSmmCpuDxeSmm core. With smm=off in QEMU the write is a no-op;
+# with SMM_REQUIRE=TRUE builds it fires the real SMI path.
+edk2_api_smi_trigger {
+	command		int8
+	data		int8
+	pad0		const[0, int16]
+} [packed]
+
+# EFI_SMM_COMMUNICATION_PROTOCOL::Communicate — the standard UEFI
+# channel for invoking SMM handlers from DXE. Each handler takes a
+# GUID-identified message buffer; the firmware's SmmCore dispatches
+# by GUID. Fuzzing this exercises SMI handler argument parsing
+# (historically a huge source of SMM privilege-escalation bugs, e.g.
+# Lenovo ThinkPwn, Dell SmmBde).
+edk2_api_smm_communicate {
+	header_guid	array[int8, 16]
+	message_len	int32[0:512]
+	message		array[int8, 0:512]
+} [packed]
+
+edk2_io_width = EfiCpuIoWidthUint8, EfiCpuIoWidthUint16, EfiCpuIoWidthUint32, EfiCpuIoWidthUint64, EfiCpuIoWidthFifoUint8, EfiCpuIoWidthFifoUint16, EfiCpuIoWidthFifoUint32, EfiCpuIoWidthFifoUint64, EfiCpuIoWidthFillUint8, EfiCpuIoWidthFillUint16, EfiCpuIoWidthFillUint32, EfiCpuIoWidthFillUint64
+
+# Raw I/O port access via EfiCpuIo2Protocol. Fuzzer-chosen port+width
+# stress-tests the platform I/O plumbing. Some writes will cause #GP
+# — caught by the CpuExceptionHandlerLib dump, surfaced as a crash.
+edk2_api_cpu_io_port_read {
+	port		int16
+	width		flags[edk2_io_width, int8]
+	pad0		const[0, int8]
+	count		int32[1:16]
+} [packed]
+
+edk2_api_cpu_io_port_write {
+	port		int16
+	width		flags[edk2_io_width, int8]
+	pad0		const[0, int8]
+	count		int32[1:16]
+	value		array[int8, 0:64]
+} [packed]
+
+edk2_api_cpu_io_mem_read {
+	address		int64
+	width		flags[edk2_io_width, int8]
+	pad0		const[0, int8]
+	pad1		const[0, int16]
+	count		int32[1:16]
+} [packed]
+
+edk2_api_cpu_io_mem_write {
+	address		int64
+	width		flags[edk2_io_width, int8]
+	pad0		const[0, int8]
+	pad1		const[0, int16]
+	count		int32[1:16]
+	value		array[int8, 0:64]
+} [packed]
+
+# MSR read/write via rdmsr/wrmsr. MANY MSRs cause #GP on write, which
+# we want — it surfaces as an X64 exception crash. Some MSRs corrupt
+# CPU state (e.g. MTRRs, IA32_EFER); restoring them requires a reboot,
+# which the snapshot-restore loop handles naturally.
+edk2_api_msr_read {
+	msr		int32
+} [packed]
+
+edk2_api_msr_write {
+	msr		int32
+	value		int64
+} [packed]
+
+# SMBIOS — install a raw entry. The entry's type+length+strings block
+# is forwarded to gSmbios->Add(), which validates structure. Malformed
+# lengths or type 127 (end-of-table) in unusual positions stress the
+# table-walker used by OS and UEFI consumers.
+edk2_api_smbios_add {
+	entry_type	int8
+	entry_length	int8[4:255]
+	entry_handle	int16
+	formatted	array[int8, 0:128]
+	strings		array[int8, 0:128]
+} [packed]
+
+edk2_api_smbios_get_next {
+	start_handle	int16
+	smbios_type	int8
+	pad0		const[0, int8]
+	pad1		const[0, int32]
+} [packed]
+
 # The discriminated union of all commands the agent understands. The
 # numeric tags MUST stay in lockstep with OvmfPkg/SyzAgentDxe/SyzAgentDxe.h.
 syz_edk2_call [
@@ -377,6 +1323,8 @@ syz_edk2_call [
 	close_event			syz_edk2_api[251, edk2_api_close_event]
 	signal_event			syz_edk2_api[252, edk2_api_signal_event]
 	raise_tpl			syz_edk2_api[253, edk2_api_raise_tpl]
+	set_timer			syz_edk2_api[254, edk2_api_set_timer]
+	wait_for_event			syz_edk2_api[255, edk2_api_wait_for_event]
 	locate_protocol			syz_edk2_api[300, edk2_api_locate_protocol]
 	locate_handle_buffer		syz_edk2_api[301, edk2_api_locate_handle_buffer]
 	install_config_table		syz_edk2_api[302, edk2_api_install_config_table]
@@ -388,11 +1336,281 @@ syz_edk2_call [
 	block_io_read_blocks		syz_edk2_api[600, edk2_api_block_io_read_blocks]
 	block_io_write_blocks		syz_edk2_api[601, edk2_api_block_io_write_blocks]
 	disk_io_read_disk		syz_edk2_api[610, edk2_api_disk_io_read_disk]
+	disk_io_write_disk		syz_edk2_api[611, edk2_api_disk_io_write_disk]
 	pci_io_mem_read			syz_edk2_api[620, edk2_api_pci_io_mem_read]
 	pci_io_pci_read			syz_edk2_api[621, edk2_api_pci_io_pci_read]
+	pci_io_mem_write		syz_edk2_api[622, edk2_api_pci_io_mem_write]
+	pci_io_pci_write		syz_edk2_api[623, edk2_api_pci_io_pci_write]
+	pci_io_io_read			syz_edk2_api[624, edk2_api_pci_io_io_read]
+	pci_io_io_write			syz_edk2_api[625, edk2_api_pci_io_io_write]
+	pci_rb_io_mem_read		syz_edk2_api[626, edk2_api_pci_rb_io_mem_read]
+	pci_rb_io_mem_write		syz_edk2_api[627, edk2_api_pci_rb_io_mem_write]
+	pci_rb_io_pci_read		syz_edk2_api[628, edk2_api_pci_rb_io_pci_read]
+	pci_rb_io_pci_write		syz_edk2_api[629, edk2_api_pci_rb_io_pci_write]
 	snp_transmit			syz_edk2_api[630, edk2_api_snp_transmit]
+	snp_receive			syz_edk2_api[631, edk2_api_snp_receive]
+	snp_get_status			syz_edk2_api[632, edk2_api_snp_get_status]
+	snp_initialize			syz_edk2_api[633, edk2_api_snp_initialize]
 	usb_io_control_transfer		syz_edk2_api[640, edk2_api_usb_io_control_transfer]
+	usb_io_bulk_transfer		syz_edk2_api[641, edk2_api_usb_io_bulk_transfer]
 	gop_blt				syz_edk2_api[650, edk2_api_gop_blt]
+	gop_set_mode			syz_edk2_api[651, edk2_api_gop_set_mode]
+	gop_query_mode			syz_edk2_api[652, edk2_api_gop_query_mode]
 	hii_update_package_list		syz_edk2_api[660, edk2_api_hii_update_package_list]
 	hii_export_package_lists	syz_edk2_api[661, edk2_api_hii_export_package_lists]
+	hii_new_string			syz_edk2_api[662, edk2_api_hii_new_string]
+	hii_get_string			syz_edk2_api[663, edk2_api_hii_get_string]
+	hii_set_string			syz_edk2_api[664, edk2_api_hii_set_string]
+	hii_get_languages		syz_edk2_api[665, edk2_api_hii_get_languages]
+	ip4_configure			syz_edk2_api[670, edk2_api_ip4_configure]
+	ip4_transmit			syz_edk2_api[671, edk2_api_ip4_transmit]
+	ip4_get_mode_data		syz_edk2_api[672, edk2_api_ip4_get_mode_data]
+	udp4_configure			syz_edk2_api[673, edk2_api_udp4_configure]
+	udp4_transmit			syz_edk2_api[674, edk2_api_udp4_transmit]
+	udp4_get_mode_data		syz_edk2_api[675, edk2_api_udp4_get_mode_data]
+	tcp4_configure			syz_edk2_api[676, edk2_api_tcp4_configure]
+	tcp4_connect			syz_edk2_api[677, edk2_api_tcp4_connect]
+	tcp4_transmit			syz_edk2_api[678, edk2_api_tcp4_transmit]
+	tcp4_get_mode_data		syz_edk2_api[679, edk2_api_tcp4_get_mode_data]
+	dhcp4_configure			syz_edk2_api[680, edk2_api_dhcp4_configure]
+	dhcp4_start			syz_edk2_api[681, edk2_api_dhcp4_start]
+	dhcp4_get_mode_data		syz_edk2_api[682, edk2_api_dhcp4_get_mode_data]
+	arp_configure			syz_edk2_api[683, edk2_api_arp_configure]
+	arp_add				syz_edk2_api[684, edk2_api_arp_add]
+	arp_request			syz_edk2_api[685, edk2_api_arp_request]
+	mnp_configure			syz_edk2_api[686, edk2_api_mnp_configure]
+	mnp_transmit			syz_edk2_api[687, edk2_api_mnp_transmit]
+	simplefs_open_volume		syz_edk2_api[700, edk2_api_simplefs_open_volume]
+	file_open			syz_edk2_api[701, edk2_api_file_open]
+	file_read			syz_edk2_api[702, edk2_api_file_read]
+	file_write			syz_edk2_api[703, edk2_api_file_write]
+	file_get_info			syz_edk2_api[704, edk2_api_file_get_info]
+	file_set_info			syz_edk2_api[705, edk2_api_file_set_info]
+	file_close			syz_edk2_api[706, edk2_api_file_close]
+	file_delete			syz_edk2_api[707, edk2_api_file_delete]
+	device_path_from_text		syz_edk2_api[710, edk2_api_device_path_from_text]
+	device_path_to_text		syz_edk2_api[711, edk2_api_device_path_to_text]
+	text_out_output_string		syz_edk2_api[720, edk2_api_text_out_output_string]
+	text_out_set_mode		syz_edk2_api[721, edk2_api_text_out_set_mode]
+	text_out_set_attribute		syz_edk2_api[722, edk2_api_text_out_set_attribute]
+	text_out_clear_screen		syz_edk2_api[723, edk2_api_text_out_clear_screen]
+	text_in_reset			syz_edk2_api[724, edk2_api_text_in_reset]
+	text_in_read_key_stroke		syz_edk2_api[725, edk2_api_text_in_read_key_stroke]
+	acpi_get_table			syz_edk2_api[730, edk2_api_acpi_get_table]
+	acpi_install_table		syz_edk2_api[731, edk2_api_acpi_install_table]
+	ip6_configure			syz_edk2_api[740, edk2_api_ip6_configure]
+	ip6_transmit			syz_edk2_api[741, edk2_api_ip6_transmit]
+	ip6_get_mode_data		syz_edk2_api[742, edk2_api_ip6_get_mode_data]
+	udp6_configure			syz_edk2_api[743, edk2_api_udp6_configure]
+	udp6_transmit			syz_edk2_api[744, edk2_api_udp6_transmit]
+	udp6_get_mode_data		syz_edk2_api[745, edk2_api_udp6_get_mode_data]
+	tcp6_configure			syz_edk2_api[746, edk2_api_tcp6_configure]
+	tcp6_connect			syz_edk2_api[747, edk2_api_tcp6_connect]
+	tcp6_transmit			syz_edk2_api[748, edk2_api_tcp6_transmit]
+	tcp6_get_mode_data		syz_edk2_api[749, edk2_api_tcp6_get_mode_data]
+	dhcp6_configure			syz_edk2_api[750, edk2_api_dhcp6_configure]
+	dhcp6_start			syz_edk2_api[751, edk2_api_dhcp6_start]
+	dhcp6_get_mode_data		syz_edk2_api[752, edk2_api_dhcp6_get_mode_data]
+	dns4_host_name_to_ip		syz_edk2_api[753, edk2_api_dns4_host_name_to_ip]
+	dns4_configure			syz_edk2_api[754, edk2_api_dns4_configure]
+	dns6_host_name_to_ip		syz_edk2_api[755, edk2_api_dns6_host_name_to_ip]
+	dns6_configure			syz_edk2_api[756, edk2_api_dns6_configure]
+	mtftp4_read_file		syz_edk2_api[757, edk2_api_mtftp4_read_file]
+	mtftp4_get_info			syz_edk2_api[758, edk2_api_mtftp4_get_info]
+	http_configure			syz_edk2_api[759, edk2_api_http_configure]
+	http_request			syz_edk2_api[760, edk2_api_http_request]
+	http_response			syz_edk2_api[761, edk2_api_http_response]
+	http_poll			syz_edk2_api[762, edk2_api_http_poll]
+	hash2_get_hash_size		syz_edk2_api[770, edk2_api_hash2_get_hash_size]
+	hash2_hash			syz_edk2_api[771, edk2_api_hash2_hash]
+	rng_get_info			syz_edk2_api[772, edk2_api_rng_get_info]
+	rng_get_rng			syz_edk2_api[773, edk2_api_rng_get_rng]
+	tcg2_get_capability		syz_edk2_api[774, edk2_api_tcg2_get_capability]
+	tcg2_hash_log_extend_event	syz_edk2_api[775, edk2_api_tcg2_hash_log_extend_event]
+	tcg2_submit_command		syz_edk2_api[776, edk2_api_tcg2_submit_command]
+	tcg2_get_event_log		syz_edk2_api[777, edk2_api_tcg2_get_event_log]
+	pkcs7_verify			syz_edk2_api[778, edk2_api_pkcs7_verify]
+	ata_passthru			syz_edk2_api[780, edk2_api_ata_passthru]
+	ata_passthru_get_next_dev	syz_edk2_api[781, edk2_api_ata_passthru_get_next_dev]
+	ext_scsi_passthru		syz_edk2_api[782, edk2_api_ext_scsi_passthru]
+	ext_scsi_get_next_device	syz_edk2_api[783, edk2_api_ext_scsi_get_next_device]
+	nvme_passthru			syz_edk2_api[784, edk2_api_nvme_passthru]
+	nvme_passthru_get_next_ns	syz_edk2_api[785, edk2_api_nvme_passthru_get_next_ns]
+	load_image			syz_edk2_api[790, edk2_api_load_image]
+	start_image			syz_edk2_api[791, edk2_api_start_image]
+	unload_image			syz_edk2_api[792, edk2_api_unload_image]
+	connect_controller		syz_edk2_api[793, edk2_api_connect_controller]
+	disconnect_controller		syz_edk2_api[794, edk2_api_disconnect_controller]
+	smi_trigger			syz_edk2_api[800, edk2_api_smi_trigger]
+	smm_communicate			syz_edk2_api[801, edk2_api_smm_communicate]
+	cpu_io_port_read		syz_edk2_api[810, edk2_api_cpu_io_port_read]
+	cpu_io_port_write		syz_edk2_api[811, edk2_api_cpu_io_port_write]
+	cpu_io_mem_read			syz_edk2_api[812, edk2_api_cpu_io_mem_read]
+	cpu_io_mem_write		syz_edk2_api[813, edk2_api_cpu_io_mem_write]
+	msr_read			syz_edk2_api[814, edk2_api_msr_read]
+	msr_write			syz_edk2_api[815, edk2_api_msr_write]
+	smbios_add			syz_edk2_api[820, edk2_api_smbios_add]
+	smbios_get_next			syz_edk2_api[821, edk2_api_smbios_get_next]
 ] [varlen]
+
+# ----------------------------------------------------------------------
+# Protocol-level variant syscalls. Each syz_edk2_run_program$<name> is
+# a variant of the base syz_edk2_run_program that sends exactly one
+# tagged command through the fwsnap trigger. This gives the fuzzer
+# per-protocol syscall names for stats/triage/splice/minimize without
+# any executor change — the C implementation is shared with the base.
+# Generated from the syz_edk2_call union above; keep this section in
+# sync when adding or removing protocols.
+# ----------------------------------------------------------------------
+syz_edk2_run_program$nop(prog ptr[in, edk2_prog1[1, edk2_api_nop_payload]])
+syz_edk2_run_program$set_variable(prog ptr[in, edk2_prog1[100, edk2_api_set_variable]])
+syz_edk2_run_program$set_variable_auth(prog ptr[in, edk2_prog1[104, edk2_api_set_variable_auth]])
+syz_edk2_run_program$set_variable_delete(prog ptr[in, edk2_prog1[105, edk2_api_set_variable_delete]])
+syz_edk2_run_program$set_variable_append(prog ptr[in, edk2_prog1[106, edk2_api_set_variable_append]])
+syz_edk2_run_program$get_variable(prog ptr[in, edk2_prog1[101, edk2_api_get_variable]])
+syz_edk2_run_program$query_variable_info(prog ptr[in, edk2_prog1[102, edk2_api_query_variable_info]])
+syz_edk2_run_program$get_next_variable_name(prog ptr[in, edk2_prog1[103, edk2_api_get_next_variable_name]])
+syz_edk2_run_program$allocate_pool(prog ptr[in, edk2_prog1[200, edk2_api_allocate_pool]]) edk2_alloc_slot
+syz_edk2_run_program$free_pool(prog ptr[in, edk2_prog1[201, edk2_api_free_pool]])
+syz_edk2_run_program$allocate_pages(prog ptr[in, edk2_prog1[202, edk2_api_allocate_pages]]) edk2_alloc_slot
+syz_edk2_run_program$free_pages(prog ptr[in, edk2_prog1[203, edk2_api_free_pages]])
+syz_edk2_run_program$copy_mem(prog ptr[in, edk2_prog1[204, edk2_api_copy_mem]])
+syz_edk2_run_program$set_mem(prog ptr[in, edk2_prog1[205, edk2_api_set_mem]])
+syz_edk2_run_program$calculate_crc32(prog ptr[in, edk2_prog1[206, edk2_api_calculate_crc32]])
+syz_edk2_run_program$get_time(prog ptr[in, edk2_prog1[230, edk2_api_get_time]])
+syz_edk2_run_program$set_time(prog ptr[in, edk2_prog1[231, edk2_api_set_time]])
+syz_edk2_run_program$stall(prog ptr[in, edk2_prog1[232, edk2_api_stall]])
+syz_edk2_run_program$set_watchdog_timer(prog ptr[in, edk2_prog1[233, edk2_api_set_watchdog_timer]])
+syz_edk2_run_program$get_monotonic_count(prog ptr[in, edk2_prog1[234, edk2_api_get_monotonic_count]])
+syz_edk2_run_program$create_event(prog ptr[in, edk2_prog1[250, edk2_api_create_event]]) edk2_event_slot
+syz_edk2_run_program$close_event(prog ptr[in, edk2_prog1[251, edk2_api_close_event]])
+syz_edk2_run_program$signal_event(prog ptr[in, edk2_prog1[252, edk2_api_signal_event]])
+syz_edk2_run_program$raise_tpl(prog ptr[in, edk2_prog1[253, edk2_api_raise_tpl]])
+syz_edk2_run_program$set_timer(prog ptr[in, edk2_prog1[254, edk2_api_set_timer]])
+syz_edk2_run_program$wait_for_event(prog ptr[in, edk2_prog1[255, edk2_api_wait_for_event]])
+syz_edk2_run_program$locate_protocol(prog ptr[in, edk2_prog1[300, edk2_api_locate_protocol]])
+syz_edk2_run_program$locate_handle_buffer(prog ptr[in, edk2_prog1[301, edk2_api_locate_handle_buffer]])
+syz_edk2_run_program$install_config_table(prog ptr[in, edk2_prog1[302, edk2_api_install_config_table]])
+syz_edk2_run_program$hii_new_package_list(prog ptr[in, edk2_prog1[400, edk2_api_hii_new_package_list]])
+syz_edk2_run_program$hii_remove_package_list(prog ptr[in, edk2_prog1[401, edk2_api_hii_remove_package_list]])
+syz_edk2_run_program$asan_poison_alloc(prog ptr[in, edk2_prog1[500, edk2_api_asan_payload]])
+syz_edk2_run_program$asan_unpoison_alloc(prog ptr[in, edk2_prog1[501, edk2_api_asan_payload]])
+syz_edk2_run_program$asan_report_alloc(prog ptr[in, edk2_prog1[502, edk2_api_asan_payload]])
+syz_edk2_run_program$block_io_read_blocks(prog ptr[in, edk2_prog1[600, edk2_api_block_io_read_blocks]])
+syz_edk2_run_program$block_io_write_blocks(prog ptr[in, edk2_prog1[601, edk2_api_block_io_write_blocks]])
+syz_edk2_run_program$disk_io_read_disk(prog ptr[in, edk2_prog1[610, edk2_api_disk_io_read_disk]])
+syz_edk2_run_program$disk_io_write_disk(prog ptr[in, edk2_prog1[611, edk2_api_disk_io_write_disk]])
+syz_edk2_run_program$pci_io_mem_read(prog ptr[in, edk2_prog1[620, edk2_api_pci_io_mem_read]])
+syz_edk2_run_program$pci_io_pci_read(prog ptr[in, edk2_prog1[621, edk2_api_pci_io_pci_read]])
+syz_edk2_run_program$pci_io_mem_write(prog ptr[in, edk2_prog1[622, edk2_api_pci_io_mem_write]])
+syz_edk2_run_program$pci_io_pci_write(prog ptr[in, edk2_prog1[623, edk2_api_pci_io_pci_write]])
+syz_edk2_run_program$pci_io_io_read(prog ptr[in, edk2_prog1[624, edk2_api_pci_io_io_read]])
+syz_edk2_run_program$pci_io_io_write(prog ptr[in, edk2_prog1[625, edk2_api_pci_io_io_write]])
+syz_edk2_run_program$pci_rb_io_mem_read(prog ptr[in, edk2_prog1[626, edk2_api_pci_rb_io_mem_read]])
+syz_edk2_run_program$pci_rb_io_mem_write(prog ptr[in, edk2_prog1[627, edk2_api_pci_rb_io_mem_write]])
+syz_edk2_run_program$pci_rb_io_pci_read(prog ptr[in, edk2_prog1[628, edk2_api_pci_rb_io_pci_read]])
+syz_edk2_run_program$pci_rb_io_pci_write(prog ptr[in, edk2_prog1[629, edk2_api_pci_rb_io_pci_write]])
+syz_edk2_run_program$snp_transmit(prog ptr[in, edk2_prog1[630, edk2_api_snp_transmit]])
+syz_edk2_run_program$snp_receive(prog ptr[in, edk2_prog1[631, edk2_api_snp_receive]])
+syz_edk2_run_program$snp_get_status(prog ptr[in, edk2_prog1[632, edk2_api_snp_get_status]])
+syz_edk2_run_program$snp_initialize(prog ptr[in, edk2_prog1[633, edk2_api_snp_initialize]])
+syz_edk2_run_program$usb_io_control_transfer(prog ptr[in, edk2_prog1[640, edk2_api_usb_io_control_transfer]])
+syz_edk2_run_program$usb_io_bulk_transfer(prog ptr[in, edk2_prog1[641, edk2_api_usb_io_bulk_transfer]])
+syz_edk2_run_program$gop_blt(prog ptr[in, edk2_prog1[650, edk2_api_gop_blt]])
+syz_edk2_run_program$gop_set_mode(prog ptr[in, edk2_prog1[651, edk2_api_gop_set_mode]])
+syz_edk2_run_program$gop_query_mode(prog ptr[in, edk2_prog1[652, edk2_api_gop_query_mode]])
+syz_edk2_run_program$hii_update_package_list(prog ptr[in, edk2_prog1[660, edk2_api_hii_update_package_list]])
+syz_edk2_run_program$hii_export_package_lists(prog ptr[in, edk2_prog1[661, edk2_api_hii_export_package_lists]])
+syz_edk2_run_program$hii_new_string(prog ptr[in, edk2_prog1[662, edk2_api_hii_new_string]])
+syz_edk2_run_program$hii_get_string(prog ptr[in, edk2_prog1[663, edk2_api_hii_get_string]])
+syz_edk2_run_program$hii_set_string(prog ptr[in, edk2_prog1[664, edk2_api_hii_set_string]])
+syz_edk2_run_program$hii_get_languages(prog ptr[in, edk2_prog1[665, edk2_api_hii_get_languages]])
+syz_edk2_run_program$ip4_configure(prog ptr[in, edk2_prog1[670, edk2_api_ip4_configure]])
+syz_edk2_run_program$ip4_transmit(prog ptr[in, edk2_prog1[671, edk2_api_ip4_transmit]])
+syz_edk2_run_program$ip4_get_mode_data(prog ptr[in, edk2_prog1[672, edk2_api_ip4_get_mode_data]])
+syz_edk2_run_program$udp4_configure(prog ptr[in, edk2_prog1[673, edk2_api_udp4_configure]])
+syz_edk2_run_program$udp4_transmit(prog ptr[in, edk2_prog1[674, edk2_api_udp4_transmit]])
+syz_edk2_run_program$udp4_get_mode_data(prog ptr[in, edk2_prog1[675, edk2_api_udp4_get_mode_data]])
+syz_edk2_run_program$tcp4_configure(prog ptr[in, edk2_prog1[676, edk2_api_tcp4_configure]])
+syz_edk2_run_program$tcp4_connect(prog ptr[in, edk2_prog1[677, edk2_api_tcp4_connect]])
+syz_edk2_run_program$tcp4_transmit(prog ptr[in, edk2_prog1[678, edk2_api_tcp4_transmit]])
+syz_edk2_run_program$tcp4_get_mode_data(prog ptr[in, edk2_prog1[679, edk2_api_tcp4_get_mode_data]])
+syz_edk2_run_program$dhcp4_configure(prog ptr[in, edk2_prog1[680, edk2_api_dhcp4_configure]])
+syz_edk2_run_program$dhcp4_start(prog ptr[in, edk2_prog1[681, edk2_api_dhcp4_start]])
+syz_edk2_run_program$dhcp4_get_mode_data(prog ptr[in, edk2_prog1[682, edk2_api_dhcp4_get_mode_data]])
+syz_edk2_run_program$arp_configure(prog ptr[in, edk2_prog1[683, edk2_api_arp_configure]])
+syz_edk2_run_program$arp_add(prog ptr[in, edk2_prog1[684, edk2_api_arp_add]])
+syz_edk2_run_program$arp_request(prog ptr[in, edk2_prog1[685, edk2_api_arp_request]])
+syz_edk2_run_program$mnp_configure(prog ptr[in, edk2_prog1[686, edk2_api_mnp_configure]])
+syz_edk2_run_program$mnp_transmit(prog ptr[in, edk2_prog1[687, edk2_api_mnp_transmit]])
+syz_edk2_run_program$simplefs_open_volume(prog ptr[in, edk2_prog1[700, edk2_api_simplefs_open_volume]]) edk2_file_slot
+syz_edk2_run_program$file_open(prog ptr[in, edk2_prog1[701, edk2_api_file_open]]) edk2_file_slot
+syz_edk2_run_program$file_read(prog ptr[in, edk2_prog1[702, edk2_api_file_read]])
+syz_edk2_run_program$file_write(prog ptr[in, edk2_prog1[703, edk2_api_file_write]])
+syz_edk2_run_program$file_get_info(prog ptr[in, edk2_prog1[704, edk2_api_file_get_info]])
+syz_edk2_run_program$file_set_info(prog ptr[in, edk2_prog1[705, edk2_api_file_set_info]])
+syz_edk2_run_program$file_close(prog ptr[in, edk2_prog1[706, edk2_api_file_close]])
+syz_edk2_run_program$file_delete(prog ptr[in, edk2_prog1[707, edk2_api_file_delete]])
+syz_edk2_run_program$device_path_from_text(prog ptr[in, edk2_prog1[710, edk2_api_device_path_from_text]])
+syz_edk2_run_program$device_path_to_text(prog ptr[in, edk2_prog1[711, edk2_api_device_path_to_text]])
+syz_edk2_run_program$text_out_output_string(prog ptr[in, edk2_prog1[720, edk2_api_text_out_output_string]])
+syz_edk2_run_program$text_out_set_mode(prog ptr[in, edk2_prog1[721, edk2_api_text_out_set_mode]])
+syz_edk2_run_program$text_out_set_attribute(prog ptr[in, edk2_prog1[722, edk2_api_text_out_set_attribute]])
+syz_edk2_run_program$text_out_clear_screen(prog ptr[in, edk2_prog1[723, edk2_api_text_out_clear_screen]])
+syz_edk2_run_program$text_in_reset(prog ptr[in, edk2_prog1[724, edk2_api_text_in_reset]])
+syz_edk2_run_program$text_in_read_key_stroke(prog ptr[in, edk2_prog1[725, edk2_api_text_in_read_key_stroke]])
+syz_edk2_run_program$acpi_get_table(prog ptr[in, edk2_prog1[730, edk2_api_acpi_get_table]])
+syz_edk2_run_program$acpi_install_table(prog ptr[in, edk2_prog1[731, edk2_api_acpi_install_table]])
+syz_edk2_run_program$ip6_configure(prog ptr[in, edk2_prog1[740, edk2_api_ip6_configure]])
+syz_edk2_run_program$ip6_transmit(prog ptr[in, edk2_prog1[741, edk2_api_ip6_transmit]])
+syz_edk2_run_program$ip6_get_mode_data(prog ptr[in, edk2_prog1[742, edk2_api_ip6_get_mode_data]])
+syz_edk2_run_program$udp6_configure(prog ptr[in, edk2_prog1[743, edk2_api_udp6_configure]])
+syz_edk2_run_program$udp6_transmit(prog ptr[in, edk2_prog1[744, edk2_api_udp6_transmit]])
+syz_edk2_run_program$udp6_get_mode_data(prog ptr[in, edk2_prog1[745, edk2_api_udp6_get_mode_data]])
+syz_edk2_run_program$tcp6_configure(prog ptr[in, edk2_prog1[746, edk2_api_tcp6_configure]])
+syz_edk2_run_program$tcp6_connect(prog ptr[in, edk2_prog1[747, edk2_api_tcp6_connect]])
+syz_edk2_run_program$tcp6_transmit(prog ptr[in, edk2_prog1[748, edk2_api_tcp6_transmit]])
+syz_edk2_run_program$tcp6_get_mode_data(prog ptr[in, edk2_prog1[749, edk2_api_tcp6_get_mode_data]])
+syz_edk2_run_program$dhcp6_configure(prog ptr[in, edk2_prog1[750, edk2_api_dhcp6_configure]])
+syz_edk2_run_program$dhcp6_start(prog ptr[in, edk2_prog1[751, edk2_api_dhcp6_start]])
+syz_edk2_run_program$dhcp6_get_mode_data(prog ptr[in, edk2_prog1[752, edk2_api_dhcp6_get_mode_data]])
+syz_edk2_run_program$dns4_host_name_to_ip(prog ptr[in, edk2_prog1[753, edk2_api_dns4_host_name_to_ip]])
+syz_edk2_run_program$dns4_configure(prog ptr[in, edk2_prog1[754, edk2_api_dns4_configure]])
+syz_edk2_run_program$dns6_host_name_to_ip(prog ptr[in, edk2_prog1[755, edk2_api_dns6_host_name_to_ip]])
+syz_edk2_run_program$dns6_configure(prog ptr[in, edk2_prog1[756, edk2_api_dns6_configure]])
+syz_edk2_run_program$mtftp4_read_file(prog ptr[in, edk2_prog1[757, edk2_api_mtftp4_read_file]])
+syz_edk2_run_program$mtftp4_get_info(prog ptr[in, edk2_prog1[758, edk2_api_mtftp4_get_info]])
+syz_edk2_run_program$http_configure(prog ptr[in, edk2_prog1[759, edk2_api_http_configure]])
+syz_edk2_run_program$http_request(prog ptr[in, edk2_prog1[760, edk2_api_http_request]])
+syz_edk2_run_program$http_response(prog ptr[in, edk2_prog1[761, edk2_api_http_response]])
+syz_edk2_run_program$http_poll(prog ptr[in, edk2_prog1[762, edk2_api_http_poll]])
+syz_edk2_run_program$hash2_get_hash_size(prog ptr[in, edk2_prog1[770, edk2_api_hash2_get_hash_size]])
+syz_edk2_run_program$hash2_hash(prog ptr[in, edk2_prog1[771, edk2_api_hash2_hash]])
+syz_edk2_run_program$rng_get_info(prog ptr[in, edk2_prog1[772, edk2_api_rng_get_info]])
+syz_edk2_run_program$rng_get_rng(prog ptr[in, edk2_prog1[773, edk2_api_rng_get_rng]])
+syz_edk2_run_program$tcg2_get_capability(prog ptr[in, edk2_prog1[774, edk2_api_tcg2_get_capability]])
+syz_edk2_run_program$tcg2_hash_log_extend_event(prog ptr[in, edk2_prog1[775, edk2_api_tcg2_hash_log_extend_event]])
+syz_edk2_run_program$tcg2_submit_command(prog ptr[in, edk2_prog1[776, edk2_api_tcg2_submit_command]])
+syz_edk2_run_program$tcg2_get_event_log(prog ptr[in, edk2_prog1[777, edk2_api_tcg2_get_event_log]])
+syz_edk2_run_program$pkcs7_verify(prog ptr[in, edk2_prog1[778, edk2_api_pkcs7_verify]])
+syz_edk2_run_program$ata_passthru(prog ptr[in, edk2_prog1[780, edk2_api_ata_passthru]])
+syz_edk2_run_program$ata_passthru_get_next_dev(prog ptr[in, edk2_prog1[781, edk2_api_ata_passthru_get_next_dev]])
+syz_edk2_run_program$ext_scsi_passthru(prog ptr[in, edk2_prog1[782, edk2_api_ext_scsi_passthru]])
+syz_edk2_run_program$ext_scsi_get_next_device(prog ptr[in, edk2_prog1[783, edk2_api_ext_scsi_get_next_device]])
+syz_edk2_run_program$nvme_passthru(prog ptr[in, edk2_prog1[784, edk2_api_nvme_passthru]])
+syz_edk2_run_program$nvme_passthru_get_next_ns(prog ptr[in, edk2_prog1[785, edk2_api_nvme_passthru_get_next_ns]])
+syz_edk2_run_program$load_image(prog ptr[in, edk2_prog1[790, edk2_api_load_image]]) edk2_image_slot
+syz_edk2_run_program$start_image(prog ptr[in, edk2_prog1[791, edk2_api_start_image]])
+syz_edk2_run_program$unload_image(prog ptr[in, edk2_prog1[792, edk2_api_unload_image]])
+syz_edk2_run_program$connect_controller(prog ptr[in, edk2_prog1[793, edk2_api_connect_controller]])
+syz_edk2_run_program$disconnect_controller(prog ptr[in, edk2_prog1[794, edk2_api_disconnect_controller]])
+syz_edk2_run_program$smi_trigger(prog ptr[in, edk2_prog1[800, edk2_api_smi_trigger]])
+syz_edk2_run_program$smm_communicate(prog ptr[in, edk2_prog1[801, edk2_api_smm_communicate]])
+syz_edk2_run_program$cpu_io_port_read(prog ptr[in, edk2_prog1[810, edk2_api_cpu_io_port_read]])
+syz_edk2_run_program$cpu_io_port_write(prog ptr[in, edk2_prog1[811, edk2_api_cpu_io_port_write]])
+syz_edk2_run_program$cpu_io_mem_read(prog ptr[in, edk2_prog1[812, edk2_api_cpu_io_mem_read]])
+syz_edk2_run_program$cpu_io_mem_write(prog ptr[in, edk2_prog1[813, edk2_api_cpu_io_mem_write]])
+syz_edk2_run_program$msr_read(prog ptr[in, edk2_prog1[814, edk2_api_msr_read]])
+syz_edk2_run_program$msr_write(prog ptr[in, edk2_prog1[815, edk2_api_msr_write]])
+syz_edk2_run_program$smbios_add(prog ptr[in, edk2_prog1[820, edk2_api_smbios_add]])
+syz_edk2_run_program$smbios_get_next(prog ptr[in, edk2_prog1[821, edk2_api_smbios_get_next]])

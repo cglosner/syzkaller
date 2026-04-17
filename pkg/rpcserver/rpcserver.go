@@ -182,9 +182,13 @@ func New(cfg *RemoteConfig) (Server, error) {
 		RPC:    cfg.RPC,
 		VMLess: cfg.VMLess,
 		// gVisor coverage is not a trace, so producing edges won't work.
-		UseCoverEdges: cfg.Experimental.CoverEdges && cfg.Type != targets.GVisor,
+		// gVisor coverage is not a trace, so producing edges won't work.
+		// edk2 coverage comes from a flat PC list (not an execution trace),
+		// so edge hashing would produce meaningless values.
+		UseCoverEdges: cfg.Experimental.CoverEdges && cfg.Type != targets.GVisor &&
+			cfg.Target.OS != targets.EDK2,
 		// gVisor/Starnix are not Linux, so filtering against Linux ranges won't work.
-		FilterSignal:      cfg.Type != targets.GVisor && cfg.Type != targets.Starnix,
+		FilterSignal: cfg.Type != targets.GVisor && cfg.Type != targets.Starnix,
 		PrintMachineCheck: true,
 		Procs:             cfg.Procs,
 		Slowdown:          cfg.Timeouts.Slowdown,

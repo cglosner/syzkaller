@@ -511,6 +511,13 @@ var List = map[string]map[string]*Target{
 				TextStart: 0x0000000000000000,
 				TextEnd:   0x0000000100000000,
 			},
+			// Firmware dispatch is much slower than kernel syscalls.
+			// Each ivshmem round-trip takes ~1-2ms, and programs with
+			// 10+ calls need longer timeouts.
+			timeouts: Timeouts{
+				Syscall: 2 * time.Second,
+				Program: 30 * time.Second,
+			},
 		},
 	},
 }
@@ -603,11 +610,12 @@ var oses = map[string]osCommon{
 	EDK2: {
 		// EDK2 firmware has no syscall numbers; the only entry point is one
 		// pseudo-syscall (syz_edk2_run_program) that talks to SyzAgentDxe.
+		// KernelObject is empty because OVMF.fd is a raw firmware image,
+		// not an ELF. Coverage comes from per-module .dll files instead.
 		BuildOS:                Linux,
 		SyscallNumbers:         false,
 		ExecutorUsesForkServer: false,
 		HostFuzzer:             true,
-		KernelObject:           "OVMF.fd",
 	},
 }
 

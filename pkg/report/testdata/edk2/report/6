@@ -1,0 +1,6 @@
+TITLE: edk2: UBSAN: __ubsan_handle_shift_out_of_bounds
+
+ASAN MEMORY ACCESS check fail! __ubsan_handle_shift_out_of_bounds is called:
+Return IP address is
+/home/gl055/research/projects/edk2-syzkaller/OvmfPkg/SyzBugsDxe/SyzBugsDxe.c, line:0x00D3, column:0x0029
+LHS:0x0000000000000001 RHS:0x0000000000000021

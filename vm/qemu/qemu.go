@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/google/syzkaller/pkg/config"
+	"github.com/google/syzkaller/pkg/cover/backend"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/report"
@@ -79,6 +80,24 @@ type Config struct {
 	Snapshot bool `json:"snapshot"`
 	// Magic key used to dongle macOS to the device.
 	AppleSmcOsk string `json:"apple_smc_osk"`
+
+	// TcgSnapshot enables the TCG + fwsnap snapshot-fuzzing backend
+	// for edk2 VMs. Instead of cold-restarting the firmware between
+	// programs, we snapshot at SyzFwfuzzTrigger entry and restore the
+	// guest state at the start of every iteration. Requires a
+	// qemu-fwfuzz binary (cglosner/qemu-fwfuzz fork) with the
+	// contrib/plugins/libfwsnap.so plugin available alongside it.
+	// Only honored for edk2/amd64.
+	TcgSnapshot bool `json:"tcg_snapshot"`
+	// QemuFwfuzz overrides the qemu-fwfuzz binary path when
+	// TcgSnapshot is true. Defaults to the cglosner fork's
+	// build-fwfuzz/qemu-system-x86_64.
+	QemuFwfuzz string `json:"qemu_fwfuzz"`
+	// FwsnapCache points at a JSON file holding cached runtime
+	// addresses (trigger/exit/input PCs) from a one-time KVM
+	// discovery boot. If empty, the manager-worker cache path in
+	// the VM template dir is used.
+	FwsnapCache string `json:"fwsnap_cache"`
 }
 
 type Pool struct {
@@ -113,6 +132,11 @@ type instance struct {
 	merger      *vmimpl.OutputMerger
 	files       map[string]string
 	*snapshot
+	// fwsnap state populated when cfg.TcgSnapshot is true (edk2 only).
+	// Non-nil fwsnapShm signals the runSerial env-var path to publish
+	// EDK2_FWSNAP_SHMID / EDK2_FWSNAP_INPUT_ADDR to the executor.
+	fwsnapShm  *fwsnapShm
+	fwsnapDisc *fwsnapDiscovery
 }
 
 type archConfig struct {
@@ -296,9 +320,30 @@ var archConfigs = map[string]*archConfig{
 			// virtio-blk for BlockIo/DiskIo
 			"-drive if=none,id=disk0,format=raw,file={{TEMPLATE}}/fuzz-disk.img",
 			"-device virtio-blk-pci,drive=disk0",
-			// USB xHCI controller + emulated tablet for UsbIo
+			// AHCI/SATA for AtaPassThru/ScsiIo/ExtScsiPassThru
+			"-device ich9-ahci,id=ahci",
+			"-drive if=none,id=sata0,format=raw,file={{TEMPLATE}}/sata-disk.img",
+			"-device ide-hd,drive=sata0,bus=ahci.0",
+			// NVMe for NvmExpressPassThru
+			"-drive if=none,id=nvme0,format=raw,file={{TEMPLATE}}/nvme-disk.img",
+			"-device nvme,serial=syzfuzz0001,drive=nvme0",
+			// FAT directory for SimpleFileSystem/File protocol
+			"-drive if=none,id=fatdisk,format=raw,file=fat:rw:{{TEMPLATE}}/fatdir",
+			"-device virtio-blk-pci,drive=fatdisk",
+			// USB xHCI controller + tablet/keyboard for UsbIo/UsbKb drivers
 			"-device qemu-xhci,id=xhci",
 			"-device usb-tablet,bus=xhci.0",
+			"-device usb-kbd,bus=xhci.0",
+			// Second NIC: e1000 exercises a different driver chain than virtio-net
+			"-netdev user,id=net1",
+			"-device e1000,netdev=net1",
+			// SD/MMC card via sdhci PCI controller (SdMmcPciHcDxe, SdDxe)
+			"-device sdhci-pci,id=sdhci",
+			"-drive if=none,id=sddrv,format=raw,file={{TEMPLATE}}/sd-disk.img",
+			"-device sd-card,drive=sddrv",
+			// Serial port for SerialIo protocol
+			"-device isa-serial,chardev=ser0",
+			"-chardev null,id=ser0",
 		}, " "),
 	},
 }
@@ -477,7 +522,121 @@ func (inst *instance) Close() error {
 	if inst.snapshot != nil {
 		inst.snapshotClose()
 	}
+	if inst.fwsnapShm != nil {
+		inst.fwsnapShm.Close()
+		inst.fwsnapShm = nil
+	}
 	return nil
+}
+
+// setupFwsnap prepares the state needed to launch qemu-fwfuzz with
+// the libfwsnap.so plugin. It is only called when Config.TcgSnapshot
+// is true AND the target is edk2/amd64.
+//
+// Steps:
+//  1. Pick a qemu-fwfuzz binary (Config.QemuFwfuzz or default).
+//  2. Swap Config.Qemu so buildQemuArgs picks up the right binary.
+//  3. Replace KVM-flavored args in archConfig.QemuArgs with TCG
+//     single-thread ones. The BQL-safe do_restore path requires
+//     single-thread TCG; see the fwsnap memory note.
+//  4. Run a one-shot KVM discovery boot if there's no cached
+//     fwsnap cache yet, to capture the firmware's trigger/exit/
+//     input PCs. KVM is fast and the PCs are stable across
+//     accelerators.
+//  5. Allocate a SysV shmem segment for the plugin control region
+//     and stash it on the instance.
+func (inst *instance) setupFwsnap() error {
+	if inst.cfg.EfiCodeDevice == "" || inst.cfg.EfiVarsDevice == "" {
+		return fmt.Errorf("TcgSnapshot requires efi_code_device and efi_vars_device")
+	}
+	fwfuzzBin := inst.cfg.QemuFwfuzz
+	if fwfuzzBin == "" {
+		return fmt.Errorf("TcgSnapshot requires qemu_fwfuzz path in config")
+	}
+	if _, err := exec.LookPath(fwfuzzBin); err != nil {
+		if _, statErr := os.Stat(fwfuzzBin); statErr != nil {
+			return fmt.Errorf("qemu_fwfuzz binary %q not found: %w", fwfuzzBin, err)
+		}
+	}
+	inst.cfg.Qemu = fwfuzzBin
+
+	// Replace KVM acceleration with single-thread TCG. See
+	// fwsnap_tcg_requirements.md: the plugin's do_restore path
+	// schedules work via async_run_on_cpu and needs the iothread-
+	// held BQL, which only single-thread RR TCG guarantees.
+	qargs := inst.cfg.QemuArgs
+	qargs = strings.ReplaceAll(qargs, "q35,accel=kvm", "q35,smm=off")
+	qargs = strings.ReplaceAll(qargs, "cpu host,migratable=off", "cpu qemu64")
+	qargs = strings.ReplaceAll(qargs, "-cpu host,migratable=off", "-cpu qemu64")
+	// Prepend the tcg accel flag.
+	if !strings.Contains(qargs, "-accel tcg") {
+		qargs = "-accel tcg,thread=single " + qargs
+	}
+	// Trim out the slow virtio/NVMe/SDHCI/xHCI/AHCI/e1000 device
+	// tree. Under TCG each of these adds PCI enumeration and
+	// driver-binding overhead, which compounds with the plugin
+	// TB-exec hook on every basic block. The fwsnap fuzz loop
+	// doesn't use these targets — it just needs the ivshmem BAR
+	// + debugcon to reach SyzAgentDxe. Strip them so boot-to-
+	// SYZFWFUZZ stays in the ~1 minute range.
+	qargs = stripEdk2HeavyDevices(qargs)
+	inst.cfg.QemuArgs = qargs
+
+	// Discovery. Cache lives next to the syz-edk2-fuzz standalone
+	// cache format so both tools share it.
+	templateDir := filepath.Join(inst.workdir, "template")
+	if err := os.MkdirAll(templateDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir template: %w", err)
+	}
+	cachePath := inst.cfg.FwsnapCache
+	if cachePath == "" {
+		cachePath = filepath.Join(templateDir, ".syz-fwfuzz-cache.json")
+	}
+	// A writable copy of the OVMF vars template (discovery boot
+	// needs to open it read-write since OVMF stages config data).
+	discVars := filepath.Join(templateDir, "fwsnap-discover-vars.fd")
+	if err := copyFile(inst.cfg.EfiVarsDevice, discVars); err != nil {
+		return fmt.Errorf("copy OVMF vars for discovery: %w", err)
+	}
+	discShm := filepath.Join(templateDir, "fwsnap-discover.shm")
+	discLog := filepath.Join(templateDir, "fwsnap-discover.log")
+	disc, err := discoverFwsnapAddresses(cachePath, fwfuzzBin,
+		inst.cfg.EfiCodeDevice, discVars, discShm, discLog)
+	if err != nil {
+		return fmt.Errorf("fwsnap discovery: %w", err)
+	}
+	inst.fwsnapDisc = disc
+
+	// Allocate the control shmem. fuzz_input_size comes from the
+	// firmware marker; the plugin has a 64 KiB minimum.
+	fuzzMax := int(disc.InputSize)
+	if fuzzMax < 64<<10 {
+		fuzzMax = 64 << 10
+	}
+	shm, err := newFwsnapShm(fuzzMax)
+	if err != nil {
+		return fmt.Errorf("allocate fwsnap shm: %w", err)
+	}
+	inst.fwsnapShm = shm
+	return nil
+}
+
+// copyFile is a small helper used by setupFwsnap to duplicate the
+// OVMF vars template for the one-shot discovery boot without
+// clobbering the per-VM copy that the main boot path makes.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, in)
+	return err
 }
 
 func (inst *instance) boot() error {
@@ -488,12 +647,37 @@ func (inst *instance) boot() error {
 	if inst.target.OS == targets.EDK2 {
 		templateDir := filepath.Join(inst.workdir, "template")
 		os.MkdirAll(templateDir, 0755)
-		// Create a small fuzz disk image for BlockIo/DiskIo testing.
+		// Create disk images for protocol method fuzzing.
 		diskPath := filepath.Join(templateDir, "fuzz-disk.img")
 		if df, err := os.Create(diskPath); err == nil {
 			df.Truncate(64 << 20) // 64 MiB raw disk
 			df.Close()
 		}
+		// SATA disk for AHCI/AtaPassThru testing.
+		sataPath := filepath.Join(templateDir, "sata-disk.img")
+		if df, err := os.Create(sataPath); err == nil {
+			df.Truncate(64 << 20)
+			df.Close()
+		}
+		// NVMe disk image.
+		nvmePath := filepath.Join(templateDir, "nvme-disk.img")
+		if df, err := os.Create(nvmePath); err == nil {
+			df.Truncate(64 << 20)
+			df.Close()
+		}
+		// SD card image for SdMmc driver chain.
+		sdPath := filepath.Join(templateDir, "sd-disk.img")
+		if df, err := os.Create(sdPath); err == nil {
+			df.Truncate(64 << 20)
+			df.Close()
+		}
+		// FAT directory for SimpleFileSystem testing. QEMU's -drive
+		// file=fat:rw:<dir> creates a virtual VVFAT disk from the dir.
+		fatDir := filepath.Join(templateDir, "fatdir")
+		os.MkdirAll(fatDir, 0755)
+		// Seed with a couple of test files so File->Open/Read has targets.
+		os.WriteFile(filepath.Join(fatDir, "test.txt"), []byte("syzkaller fuzz test file\n"), 0644)
+		os.WriteFile(filepath.Join(fatDir, "data.bin"), make([]byte, 4096), 0644)
 		shmPath := filepath.Join(templateDir, "syz-edk2.shm")
 		os.Remove(shmPath)
 		f, err := os.Create(shmPath)
@@ -506,6 +690,15 @@ func (inst *instance) boot() error {
 		}
 		f.Close()
 	}
+	// TcgSnapshot mode: swap qemu binary + accel flags, do one-shot
+	// discovery (KVM) to get the firmware's trigger/exit/input PCs,
+	// allocate the fwsnap SysV control shmem, and prepare to append
+	// the -plugin arg in buildQemuArgs.
+	if inst.cfg.TcgSnapshot && inst.target.OS == targets.EDK2 {
+		if err := inst.setupFwsnap(); err != nil {
+			return fmt.Errorf("tcg-snapshot setup: %w", err)
+		}
+	}
 	args, err := inst.buildQemuArgs()
 	if err != nil {
 		return err
@@ -515,10 +708,26 @@ func (inst *instance) boot() error {
 	}
 	inst.args = args
 	qemu := osutil.Command(inst.cfg.Qemu, args...)
+	// fwsnap plugin paths are resolved relative to qemu's cwd, so run
+	// from the directory that contains contrib/plugins/libfwsnap.so.
+	if inst.cfg.TcgSnapshot && inst.cfg.QemuFwfuzz != "" {
+		qemu.Dir = fwsnapPluginDir(inst.cfg.QemuFwfuzz)
+	}
 	qemu.Stdout = inst.wpipe
 	qemu.Stderr = inst.wpipe
 	if err := qemu.Start(); err != nil {
 		return fmt.Errorf("failed to start %v %+v: %w", inst.cfg.Qemu, args, err)
+	}
+	// Once qemu is running, tail its debug-con log until we see the
+	// SYZFWFUZZ marker so we can publish the correct (TCG-side)
+	// shadow region into the fwsnap control shmem before the plugin
+	// takes its first snapshot. OVMF places the ivshmem BAR at a
+	// different PCI64 address under TCG vs KVM, so the discovery
+	// cache cannot be trusted for shadow — see fwsnap_edk2.go.
+	if inst.fwsnapShm != nil {
+		templateDir := filepath.Join(inst.workdir, "template")
+		debugLog := filepath.Join(templateDir, "edk2-debug.log")
+		go watchDebugLogForShadow(debugLog, inst.fwsnapShm, os.Stderr, backend.SetEdk2RuntimeAddrs)
 	}
 	inst.wpipe.Close()
 	inst.wpipe = nil
@@ -708,14 +917,22 @@ func (inst *instance) buildQemuArgs() ([]string, error) {
 	}
 	if inst.cfg.EfiVarsDevice != "" {
 		// For edk2 fuzzing the variable store must be writable so SetVariable
-		// reaches QemuFlashFvbServicesRuntimeDxe; pkg/build/edk2.go stashes a
-		// pristine OVMF_VARS.template.fd that the user copies per VM launch.
+		// reaches QemuFlashFvbServicesRuntimeDxe. Make a per-VM copy so we
+		// don't modify the pristine template and trigger syz-manager's
+		// file-modification check.
+		varsFile := inst.cfg.EfiVarsDevice
 		readonly := "readonly=on"
 		if inst.os == targets.EDK2 {
 			readonly = "readonly=off"
+			templateDir := filepath.Join(inst.workdir, "template")
+			perVMVars := filepath.Join(templateDir, "OVMF_VARS.fd")
+			if err := osutil.CopyFile(inst.cfg.EfiVarsDevice, perVMVars); err != nil {
+				return nil, fmt.Errorf("failed to copy OVMF_VARS: %w", err)
+			}
+			varsFile = perVMVars
 		}
 		args = append(args,
-			"-drive", "if=pflash,format=raw,"+readonly+",file="+inst.cfg.EfiVarsDevice,
+			"-drive", "if=pflash,format=raw,"+readonly+",file="+varsFile,
 		)
 	}
 	if inst.cfg.AppleSmcOsk != "" {
@@ -729,6 +946,20 @@ func (inst *instance) buildQemuArgs() ([]string, error) {
 			return nil, err
 		}
 		args = append(args, snapshotArgs...)
+	}
+	// Append the fwsnap plugin arg last, so it attaches after all
+	// devices. We use a relative path — qemu.Dir is set to the
+	// plugin build dir in boot() so the plugin can be loaded.
+	if inst.fwsnapShm != nil && inst.fwsnapDisc != nil {
+		pluginArg := buildFwsnapPluginArg(inst.fwsnapDisc, inst.fwsnapShm.id,
+			"contrib/plugins/libfwsnap.so")
+		args = append(args, "-plugin", pluginArg)
+		// Route plugin qemu_plugin_outs() into a dedicated log in
+		// the VM template dir so we can see snapshot/restore
+		// events. Without -d plugin + -D, the plugin's messages
+		// are silently dropped.
+		pluginLog := filepath.Join(inst.workdir, "template", "fwsnap-plugin.log")
+		args = append(args, "-D", pluginLog, "-d", "plugin")
 	}
 	return args, nil
 }
@@ -885,6 +1116,22 @@ func (inst *instance) Run(ctx context.Context, command string) (
 		shmPath := filepath.Join(inst.workdir, "template", "syz-edk2.shm")
 		os.Setenv("EDK2_IVSHMEM", shmPath)
 		log.Logf(0, "edk2: setting EDK2_IVSHMEM=%v for executor", shmPath)
+		// TcgSnapshot mode: also publish the SysV shmid of the
+		// fwsnap control region + the guest physical address of
+		// the fuzz_input buffer. The executor's syz_edk2_run_program
+		// fast-path attaches to this shmem and uses the plugin's
+		// RESTORE command instead of the ivshmem doorbell, giving
+		// per-iteration state rollback.
+		if inst.fwsnapShm != nil && inst.fwsnapDisc != nil {
+			os.Setenv("EDK2_FWSNAP_SHMID",
+				strconv.Itoa(inst.fwsnapShm.id))
+			os.Setenv("EDK2_FWSNAP_INPUT_ADDR",
+				fmt.Sprintf("0x%x", inst.fwsnapDisc.InputPhys))
+			os.Setenv("EDK2_FWSNAP_FUZZ_MAX",
+				strconv.Itoa(inst.fwsnapShm.fmax))
+			log.Logf(0, "edk2 fwsnap: shmid=%d input_addr=0x%x fuzz_max=%d",
+				inst.fwsnapShm.id, inst.fwsnapDisc.InputPhys, inst.fwsnapShm.fmax)
+		}
 	}
 	if err := cmd.Start(); err != nil {
 		wpipe.Close()

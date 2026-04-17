@@ -49,21 +49,46 @@ public:
 
 		// Build the child environment. We pass a minimal set to avoid
 		// interference, but edk2 needs EDK2_IVSHMEM for the ivshmem
-		// shared memory transport.
+		// shared memory transport. When TcgSnapshot mode is enabled,
+		// we also forward EDK2_FWSNAP_SHMID / EDK2_FWSNAP_INPUT_ADDR
+		// / EDK2_FWSNAP_FUZZ_MAX so syz_edk2_run_program can attach
+		// to the fwsnap control region and use the plugin's RESTORE
+		// path instead of the ivshmem doorbell.
 		const char* edk2_ivshmem = getenv("EDK2_IVSHMEM");
-		static char edk2_env_buf[512];
+		const char* edk2_fwsnap_shmid = getenv("EDK2_FWSNAP_SHMID");
+		const char* edk2_fwsnap_addr = getenv("EDK2_FWSNAP_INPUT_ADDR");
+		const char* edk2_fwsnap_fmax = getenv("EDK2_FWSNAP_FUZZ_MAX");
+		static char edk2_ivshmem_buf[512];
+		static char edk2_fwsnap_shmid_buf[64];
+		static char edk2_fwsnap_addr_buf[64];
+		static char edk2_fwsnap_fmax_buf[64];
 		if (edk2_ivshmem)
-			snprintf(edk2_env_buf, sizeof(edk2_env_buf), "EDK2_IVSHMEM=%s", edk2_ivshmem);
-		const char* child_envp_with_edk2[] = {
-		    "ASAN_OPTIONS=handle_segv=0 allow_user_segv_handler=1 detect_leaks=0",
-		    "GLIBC_TUNABLES=glibc.pthread.rseq=0",
-		    edk2_env_buf,
-		    nullptr};
-		const char* child_envp_plain[] = {
-		    "ASAN_OPTIONS=handle_segv=0 allow_user_segv_handler=1 detect_leaks=0",
-		    "GLIBC_TUNABLES=glibc.pthread.rseq=0",
-		    nullptr};
-		const char** child_envp = edk2_ivshmem ? child_envp_with_edk2 : child_envp_plain;
+			snprintf(edk2_ivshmem_buf, sizeof(edk2_ivshmem_buf),
+				 "EDK2_IVSHMEM=%s", edk2_ivshmem);
+		if (edk2_fwsnap_shmid)
+			snprintf(edk2_fwsnap_shmid_buf, sizeof(edk2_fwsnap_shmid_buf),
+				 "EDK2_FWSNAP_SHMID=%s", edk2_fwsnap_shmid);
+		if (edk2_fwsnap_addr)
+			snprintf(edk2_fwsnap_addr_buf, sizeof(edk2_fwsnap_addr_buf),
+				 "EDK2_FWSNAP_INPUT_ADDR=%s", edk2_fwsnap_addr);
+		if (edk2_fwsnap_fmax)
+			snprintf(edk2_fwsnap_fmax_buf, sizeof(edk2_fwsnap_fmax_buf),
+				 "EDK2_FWSNAP_FUZZ_MAX=%s", edk2_fwsnap_fmax);
+		// Build the env array dynamically so we can skip unset vars.
+		static const char* child_envp_buf[8];
+		int envc = 0;
+		child_envp_buf[envc++] = "ASAN_OPTIONS=handle_segv=0 allow_user_segv_handler=1 detect_leaks=0";
+		child_envp_buf[envc++] = "GLIBC_TUNABLES=glibc.pthread.rseq=0";
+		if (edk2_ivshmem)
+			child_envp_buf[envc++] = edk2_ivshmem_buf;
+		if (edk2_fwsnap_shmid)
+			child_envp_buf[envc++] = edk2_fwsnap_shmid_buf;
+		if (edk2_fwsnap_addr)
+			child_envp_buf[envc++] = edk2_fwsnap_addr_buf;
+		if (edk2_fwsnap_fmax)
+			child_envp_buf[envc++] = edk2_fwsnap_fmax_buf;
+		child_envp_buf[envc] = nullptr;
+		const char** child_envp = child_envp_buf;
 
 		if (posix_spawnp(&pid_, argv[0], &actions, &attr,
 				 const_cast<char**>(argv), const_cast<char**>(child_envp)))

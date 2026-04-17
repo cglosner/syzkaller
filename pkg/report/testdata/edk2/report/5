@@ -1,0 +1,5 @@
+TITLE: edk2: ASSERT in Variable (MdeModulePkg/Universal/Variable/RuntimeDxe/VariableParsing.c:LINE): Variable->StartId != NUM
+
+VariableServiceGetNextVariableName: fetch
+ASSERT [Variable] MdeModulePkg/Universal/Variable/RuntimeDxe/VariableParsing.c:123 Variable->StartId != 0
+[SYZ-AGENT] guest aborted

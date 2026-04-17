@@ -2,9 +2,10 @@
 
 Generic setup instructions for fuzzing Linux kernel are outlined [here](linux/setup.md).
 
-For other kernels see:
+For other kernels and firmware targets see:
 [FreeBSD](freebsd/README.md),
 [Darwin/XNU](darwin/README.md),
+[EDK2/UEFI](edk2/README.md),
 [Fuchsia](fuchsia/README.md),
 [NetBSD](netbsd/README.md),
 [OpenBSD](openbsd/setup.md),

@@ -42,6 +42,10 @@ USE_GRAMMAR="${USE_GRAMMAR:-1}"
 # forwards raw fuzzer bytes to Hii->NewPackageList, which wedges on
 # malformed package headers. Override with GRAMMAR_SKIP="" to enable.
 GRAMMAR_SKIP="${GRAMMAR_SKIP:-400,401}"
+# Total number of functions in the DXE firmware image (for coverage %).
+# Derived from: nm --defined-only on all Build/.../X64/*.dll | grep -c ' [tT] '.
+# Set to 0 to disable percentage output.
+TOTAL_FUNCS="${TOTAL_FUNCS:-31724}"
 
 mkdir -p "${WORKDIR}"
 
@@ -158,8 +162,9 @@ run_fuzz() {
         -call-set "${CALL_SET}" \
         -prog-log "${WORKDIR}/programs.log" \
         -syz-prog \
+        -total-funcs "${TOTAL_FUNCS}" \
         "${extra[@]}" \
-        > "${SUMMARY}" 2> "${WORKDIR}/fuzz-stderr.log"
+        > "${SUMMARY}" 2> >(tee "${WORKDIR}/fuzz-stderr.log" >&2)
 }
 
 set +e
@@ -175,9 +180,10 @@ tail -20 "${DEBUG_LOG}" 2>&1 || true
 acks=$(grep '"acks"' "${SUMMARY}" 2>/dev/null | head -1 | grep -oE '[0-9]+' | head -1 || echo 0)
 progs=$(grep '"programs"' "${SUMMARY}" 2>/dev/null | head -1 | grep -oE '[0-9]+' | head -1 || echo 0)
 covpcs=$(grep '"unique_cover_pcs"' "${SUMMARY}" 2>/dev/null | head -1 | grep -oE '[0-9]+' | head -1 || echo 0)
+covpct=$(grep '"coverage_percent"' "${SUMMARY}" 2>/dev/null | head -1 | grep -oE '[0-9]+\.?[0-9]*' | head -1 || echo 0)
 
 if [[ "${RC}" == "0" && "${acks}" -gt 0 ]]; then
-    ok "campaign success: ${progs} programs, ${acks} acks, ${covpcs} unique cover PCs"
+    ok "campaign success: ${progs} programs, ${acks} acks, ${covpcs} unique cover PCs (${covpct}% of firmware)"
     exit 0
 fi
 
@@ -211,9 +217,10 @@ tail -20 "${DEBUG_LOG}" 2>&1 || true
 acks=$(grep '"acks"' "${SUMMARY}" 2>/dev/null | head -1 | grep -oE '[0-9]+' | head -1 || echo 0)
 progs=$(grep '"programs"' "${SUMMARY}" 2>/dev/null | head -1 | grep -oE '[0-9]+' | head -1 || echo 0)
 covpcs=$(grep '"unique_cover_pcs"' "${SUMMARY}" 2>/dev/null | head -1 | grep -oE '[0-9]+' | head -1 || echo 0)
+covpct=$(grep '"coverage_percent"' "${SUMMARY}" 2>/dev/null | head -1 | grep -oE '[0-9]+\.?[0-9]*' | head -1 || echo 0)
 
 if [[ "${RC}" == "0" && "${acks}" -gt 0 ]]; then
-    ok "modified-qemu campaign success: ${progs} programs, ${acks} acks, ${covpcs} unique cover PCs"
+    ok "modified-qemu campaign success: ${progs} programs, ${acks} acks, ${covpcs} unique cover PCs (${covpct}% of firmware)"
     exit 0
 fi
 

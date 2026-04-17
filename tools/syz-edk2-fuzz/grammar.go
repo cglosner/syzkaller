@@ -71,6 +71,9 @@ func getGrammarTarget() (*grammarTarget, error) {
 	if err != nil {
 		return nil, fmt.Errorf("prog.GetTarget(edk2/amd64): %w", err)
 	}
+	if chainRng == nil {
+		chainRng = rand.New(rand.NewSource(1))
+	}
 	return &grammarTarget{
 		target: t,
 		ct:     t.DefaultChoiceTable(),
@@ -148,12 +151,24 @@ func walkSyzEdk2RunProgram(call *prog.Call, p *prog.Prog) (*program, error) {
 	if numCalls == 0 {
 		return nil, fmt.Errorf("no translatable variants in edk2_program")
 	}
+	// Post-walk slot chaining: rewrite alloc_index fields to point at
+	// actually-live slots so alloc→use→free sequences succeed on the
+	// agent side. Without this, most "use" calls hit empty slots.
+	wireBytes := buf.Bytes()
+	if chainRng != nil {
+		rewriteCallsForSlotChaining(wireBytes, numCalls, chainRng)
+	}
 	syzText := ""
 	if flagSyzProg != nil && *flagSyzProg {
 		syzText = string(p.Serialize())
 	}
-	return &program{NumCalls: numCalls, Wire: buf.Bytes(), SyzProg: syzText}, nil
+	return &program{NumCalls: numCalls, Wire: wireBytes, SyzProg: syzText}, nil
 }
+
+// chainRng is a package-level RNG used for slot chaining decisions.
+// It is seeded once at startup so programs are deterministic given
+// the overall -seed flag.
+var chainRng *rand.Rand
 
 // emitUnionVariant translates one syz_edk2_call union variant into a
 // wire-format (call, size, payload) record. The Option of the union is

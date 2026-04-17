@@ -86,3 +86,20 @@ TPL_APPLICATION = 4
 TPL_CALLBACK = 8
 TPL_NOTIFY = 16
 TPL_HIGH_LEVEL = 31
+# File modes
+EFI_FILE_MODE_READ = 1
+EFI_FILE_MODE_WRITE = 2
+EFI_FILE_MODE_CREATE = 9223372036854775808
+# EFI_CPU_IO_PROTOCOL_WIDTH — matches PiDxeCis.h
+EfiCpuIoWidthUint8 = 0
+EfiCpuIoWidthUint16 = 1
+EfiCpuIoWidthUint32 = 2
+EfiCpuIoWidthUint64 = 3
+EfiCpuIoWidthFifoUint8 = 4
+EfiCpuIoWidthFifoUint16 = 5
+EfiCpuIoWidthFifoUint32 = 6
+EfiCpuIoWidthFifoUint64 = 7
+EfiCpuIoWidthFillUint8 = 8
+EfiCpuIoWidthFillUint16 = 9
+EfiCpuIoWidthFillUint32 = 10
+EfiCpuIoWidthFillUint64 = 11

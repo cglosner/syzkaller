@@ -252,6 +252,7 @@ static uint32 output_size;
 static void mmap_output(uint32 size);
 static uint32 hash(uint32 a);
 static bool dedup(uint8 index, uint64 sig);
+static void dedup_clear();
 
 static uint64 start_time_ms = 0;
 static bool flag_debug;
@@ -631,12 +632,22 @@ int main(int argc, char** argv)
 #endif
 
 		if (fcntl(kMaxSignalFd, F_GETFD) != -1) {
+#if !GOOS_edk2
 			// Use random addresses for coverage filters to not collide with output_data.
+			// For edk2, skip max_signal: the firmware cover ring can contain
+			// stale boot PCs that pollute the signal set and cause all
+			// subsequent programs to appear signal-less.
 			max_signal.emplace(kMaxSignalFd, reinterpret_cast<void*>(0x110c230000ull));
+#endif
 			close(kMaxSignalFd);
 		}
 		if (fcntl(kCoverFilterFd, F_GETFD) != -1) {
+#if !GOOS_edk2
+			// For edk2, skip cover_filter: the manager can't populate
+			// the filter bitmap with firmware PCs (no kernel modules),
+			// causing coverage_filter() to reject all firmware PCs.
 			cover_filter.emplace(kCoverFilterFd, reinterpret_cast<void*>(0x110f230000ull));
+#endif
 			close(kCoverFilterFd);
 		}
 
@@ -943,6 +954,20 @@ void execute_one()
 		failmsg("bad request type", "type=%llu", (uint64)request_type);
 
 	in_execute_one = true;
+#if GOOS_edk2
+	// Clear the signal dedup table between program executions.
+	// For edk2, PCs are stable (no KASLR) and programs often hit
+	// overlapping firmware code. Without clearing, the dedup table
+	// fills with common PCs from the first few executions and
+	// filters all subsequent signal as "already seen".
+	dedup_clear();
+	// Reset the fwsnap program-scope flag so the FIRST protocol call
+	// of this program triggers FWSNAP_CMD_RESTORE (pristine firmware
+	// state). Subsequent calls in the same program send FWSNAP_CMD_RERUN
+	// and inherit the firmware state from earlier calls — enables
+	// cross-call chains (allocate→use→free, create_event→signal, ...).
+	syz_edk2_fwsnap_program_reset();
+#endif
 #if GOOS_linux
 	char buf[64];
 	// Linux TASK_COMM_LEN is only 16, so the name needs to be compact.
@@ -1615,6 +1640,11 @@ static uint32 hash(uint32 a)
 const uint32 dedup_table_size = 8 << 10;
 uint64 dedup_table_sig[dedup_table_size];
 uint8 dedup_table_index[dedup_table_size];
+
+static void dedup_clear()
+{
+	memset(dedup_table_sig, 0, sizeof(dedup_table_sig));
+}
 
 // Poorman's best-effort hashmap-based deduplication.
 static bool dedup(uint8 index, uint64 sig)

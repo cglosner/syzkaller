@@ -73,7 +73,7 @@ var (
 	flagInitrd      = flag.String("initrd", "", "initramfs.cpio.gz path (required)")
 	flagDebugLog    = flag.String("ovmf-debug-log", "", "OVMF debug-con output path")
 	flagShmem       = flag.String("shmem", "/tmp/syz-edk2-smi.shm", "ivshmem backing file path")
-	flagWorkdir    = flag.String("workdir", "/tmp/syz-edk2-smi-work", "per-VM workdir")
+	flagWorkdir     = flag.String("workdir", "/tmp/syz-edk2-smi-work", "per-VM workdir")
 	flagDuration    = flag.Duration("duration", 60*time.Second, "campaign length")
 	flagSeed        = flag.Int64("seed", time.Now().UnixNano(), "random seed")
 	flagQemu        = flag.String("qemu", "qemu-system-x86_64", "qemu binary")

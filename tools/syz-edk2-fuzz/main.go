@@ -43,6 +43,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	progPkg "github.com/google/syzkaller/prog"
 )
 
 // Wire format constants must stay in lockstep with
@@ -98,6 +100,25 @@ var (
 	flagGrammarSkip = flag.String("grammar-skip", "", "comma-separated list of API ids to drop from grammar-generated programs (debug)")
 	flagProgLog     = flag.String("prog-log", "", "if set, write each program's call IDs to this file (one line per program, crash-triggering programs marked with CRASH)")
 	flagSyzProg     = flag.Bool("syz-prog", false, "also dump the syzlang serialized form of each grammar program to the prog log")
+	flagTotalFuncs  = flag.Int("total-funcs", 0, "total number of functions in the firmware image (used to compute coverage percentage); 0 disables percentage output")
+	flagStatusEvery = flag.Duration("status-every", 5*time.Second, "print a status line to stderr at this interval (0 disables)")
+	flagCorpusFile  = flag.String("corpus", "", "path to corpus file (coverage-guided mutation); if empty, every iteration generates a fresh random program")
+	flagMutateRate  = flag.Float64("mutate-rate", 0.8, "probability of mutating a corpus entry vs generating fresh (only used when -corpus is set)")
+	flagJobs        = flag.Int("jobs", 1, "number of parallel VM workers (each runs its own QEMU with separate ivshmem/vars files)")
+	flagWarmReset   = flag.Bool("warm-reset", false, "on agent timeout, reset the firmware via QEMU monitor (system_reset) instead of killing and relaunching QEMU; much faster but keeps whatever state QEMU has accumulated")
+	flagMonitorPort = flag.Int("monitor-port", 0, "TCP port for QEMU HMP monitor (0 = auto); needed for -warm-reset")
+	// Snapshot fuzzing via cglosner/qemu-fwfuzz + libfwsnap.so.
+	// In this mode we switch from KVM + cold restart to TCG + per-
+	// iteration snapshot/restore via the fwsnap plugin. The guest
+	// boots once, hits SyzFwfuzzTrigger() which fwsnap snapshots, and
+	// from then on each program is injected via fwsnap's fuzz_input
+	// mechanism and executed via a RESTORE command. No boot overhead
+	// between iterations.
+	flagTcgSnapshot = flag.Bool("tcg-snapshot", false, "use TCG + fwsnap snapshot fuzzing instead of KVM + cold restart")
+	flagQemuFwfuzz  = flag.String("qemu-fwfuzz", "/home/gl055/research/projects/qemu-fwfuzz/build-fwfuzz/qemu-system-x86_64", "path to the qemu-fwfuzz binary (used with -tcg-snapshot)")
+	flagTrigger     = flag.Uint64("trigger", 0, "SyzFwfuzzTrigger PC (hex); if 0, auto-discover via TCG pre-boot")
+	flagInputAddr   = flag.Uint64("input-addr", 0, "gSyzFwfuzzInputBuffer physical address (hex); if 0, auto-discover")
+	flagExitPc      = flag.Uint64("exit-pc", 0, "fwsnap exit_trigger PC (hex); defaults to same as -trigger")
 )
 
 type stats struct {
@@ -118,6 +139,8 @@ type runResult struct {
 	GuestErrors     uint64   `json:"guest_errors"`
 	CallsDispatched uint64   `json:"calls_dispatched"`
 	UniqueCoverPCs  uint64   `json:"unique_cover_pcs"`
+	TotalFuncs      int      `json:"total_funcs,omitempty"`
+	CoveragePercent float64  `json:"coverage_percent,omitempty"`
 	DurationSec     float64  `json:"duration_sec"`
 	BootDurationSec float64  `json:"boot_duration_sec"`
 	CrashTitles     []string `json:"crash_titles"`
@@ -138,7 +161,17 @@ func main() {
 	}
 
 	// Per-VM writable copy of OVMF_VARS.fd so SetVariable works.
-	varsCopy := filepath.Join(*flagWorkdir, "OVMF_VARS.fd")
+	if *flagJobs < 1 {
+		fail("-jobs must be >= 1")
+	}
+	// Multi-job mode: fork N child processes each with -jobs=1 on an
+	// isolated workdir/shmem, then aggregate their JSON summaries.
+	if *flagJobs > 1 {
+		runMultiJob(*flagJobs)
+		return
+	}
+	wp := newWorkerPaths(0)
+	varsCopy := wp.varsCopy
 	if err := copyFile(*flagOvmfVars, varsCopy); err != nil {
 		fail("copy vars: %v", err)
 	}
@@ -178,16 +211,42 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	startBoot := time.Now()
-	qemu := launchQemu(ctx, varsCopy)
-	defer func() {
-		_ = qemu.Process.Kill()
-		_, _ = qemu.Process.Wait()
-	}()
+
+	// TCG snapshot mode: launch qemu-fwfuzz with the fwsnap plugin.
+	// In this mode, waitForAgent is replaced by WaitStatus(SNAP_READY)
+	// inside launchQemuTcgSnapshot.
+	var fs *fwsnap
+	var tcgRes *tcgDiscoveryResult
+	var qemu *exec.Cmd
+	if *flagTcgSnapshot {
+		var lerr error
+		qemu, fs, tcgRes, lerr = launchQemuTcgSnapshot(ctx, wp)
+		if lerr != nil {
+			fail("tcg-snapshot launch: %v", lerr)
+		}
+		defer func() {
+			if fs != nil {
+				fs.Close()
+			}
+			if qemu != nil && qemu.Process != nil {
+				_ = qemu.Process.Kill()
+				_, _ = qemu.Process.Wait()
+			}
+		}()
+	} else {
+		qemu = launchQemu(ctx, wp)
+		defer func() {
+			_ = qemu.Process.Kill()
+			_, _ = qemu.Process.Wait()
+		}()
+	}
 
 	// Wait for SyzAgentDxe to set up the dispatch timer. We poll the
 	// agent by sending a sentinel "nop" program; once we get a clean
 	// ack with status=0 we know the transport is up.
-	if err := waitForAgent(shmem.Data); err != nil {
+	if *flagTcgSnapshot {
+		// Agent-ready already verified by launchQemuTcgSnapshot.
+	} else if err := waitForAgent(shmem.Data); err != nil {
 		dumpDebugTail(*flagOvmfDebug, 80)
 		fail("agent not ready: %v", err)
 	}
@@ -203,6 +262,12 @@ func main() {
 	deadline := time.Now().Add(*flagDuration)
 	rng := rand.New(rand.NewSource(*flagSeed))
 	pcSet := make(map[uint64]struct{})
+
+	// Coverage-guided corpus for mutation. Only active when -corpus is set.
+	var fc *fuzzCorpus
+	if *flagCorpusFile != "" {
+		fc = newFuzzCorpus(*flagCorpusFile)
+	}
 
 	// Program log — write each program's call IDs + result so the
 	// user can see what was sent and correlate with crashes.
@@ -234,6 +299,62 @@ func main() {
 			}
 			fmt.Fprintf(os.Stderr, "[grammar] skipping ids %v\n", grammarSkipIDs)
 		}
+		// Load persistent corpus from disk if configured.
+		if fc != nil {
+			if err := fc.Load(gt); err != nil {
+				fmt.Fprintf(os.Stderr, "[corpus] load warning: %v\n", err)
+			}
+		}
+	}
+	// Periodic corpus save so progress survives crashes.
+	if fc != nil {
+		saveTick := time.NewTicker(30 * time.Second)
+		defer saveTick.Stop()
+		go func() {
+			for range saveTick.C {
+				if err := fc.Save(); err != nil {
+					fmt.Fprintf(os.Stderr, "[corpus] save warning: %v\n", err)
+				}
+			}
+		}()
+	}
+
+	// Periodic status line to stderr so the operator can see live progress.
+	if *flagStatusEvery > 0 {
+		statusTick := time.NewTicker(*flagStatusEvery)
+		defer statusTick.Stop()
+		go func() {
+			for range statusTick.C {
+				progs := st.Programs.Load()
+				acks := st.Acks.Load()
+				touts := st.Timeouts.Load()
+				covPCs := st.UniqueCovPCs.Load()
+				elapsed := time.Since(st.StartedAt).Truncate(time.Second)
+				if *flagTotalFuncs > 0 {
+					pct := float64(covPCs) / float64(*flagTotalFuncs) * 100
+					fmt.Fprintf(os.Stderr,
+						"[status %s] progs=%d acks=%d timeouts=%d cover=%d/%d (%.1f%%)\n",
+						elapsed, progs, acks, touts, covPCs, *flagTotalFuncs, pct)
+				} else {
+					fmt.Fprintf(os.Stderr,
+						"[status %s] progs=%d acks=%d timeouts=%d cover=%d\n",
+						elapsed, progs, acks, touts, covPCs)
+				}
+			}
+		}()
+	}
+
+	// Connect to QEMU HMP monitor if warm-reset mode is enabled.
+	var monitor *qmpMonitor
+	if *flagWarmReset && *flagMonitorPort > 0 {
+		m, err := openQmpMonitor(fmt.Sprintf("127.0.0.1:%d", *flagMonitorPort), 5*time.Second)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[warm-reset] monitor connect failed: %v (falling back to cold restart)\n", err)
+		} else {
+			monitor = m
+			fmt.Fprintf(os.Stderr, "[warm-reset] HMP monitor connected on port %d\n", *flagMonitorPort)
+			defer monitor.Close()
+		}
 	}
 
 	progsThisVM := uint64(0)
@@ -247,6 +368,31 @@ func main() {
 		// Auto-restart if the agent appears dead (N consecutive timeouts
 		// means the firmware hit a CpuDeadLoop from an ASSERT or exception).
 		if consecutiveTimeouts >= maxConsecutiveTimeouts {
+			if monitor != nil {
+				// Warm reset: use QEMU's HMP system_reset to re-enter
+				// the firmware reset vector without killing the process.
+				fmt.Fprintf(os.Stderr, "[warm-reset] %d timeouts — system_reset\n", consecutiveTimeouts)
+				// Clear control region before reset so the new boot
+				// starts with a clean doorbell.
+				for i := range shmem.Data[edk2OffHostSeq : edk2OffHostSeq+12] {
+					shmem.Data[int(edk2OffHostSeq)+i] = 0
+				}
+				writeU32(shmem.Data, edk2OffCoverCount, 0)
+				if err := monitor.SystemReset(); err != nil {
+					fmt.Fprintf(os.Stderr, "[warm-reset] system_reset failed: %v, falling back to cold restart\n", err)
+					monitor.Close()
+					monitor = nil
+				} else {
+					if err := waitForAgent(shmem.Data); err != nil {
+						fmt.Fprintf(os.Stderr, "[warm-reset] agent not ready after reset: %v\n", err)
+						st.Timeouts.Add(1)
+						break
+					}
+					progsThisVM = 0
+					consecutiveTimeouts = 0
+					continue
+				}
+			}
 			fmt.Fprintf(os.Stderr, "[auto-restart] %d consecutive timeouts — restarting QEMU\n",
 				consecutiveTimeouts)
 			_ = qemu.Process.Kill()
@@ -256,10 +402,24 @@ func main() {
 			}
 			writeU32(shmem.Data, edk2OffCoverCount, 0)
 			_ = copyFile(*flagOvmfVars, varsCopy)
-			qemu = launchQemu(ctx, varsCopy)
-			if err := waitForAgent(shmem.Data); err != nil {
-				st.Timeouts.Add(1)
-				break
+			if *flagTcgSnapshot {
+				if fs != nil {
+					fs.Close()
+					fs = nil
+				}
+				var lerr error
+				qemu, fs, tcgRes, lerr = launchQemuTcgSnapshot(ctx, wp)
+				if lerr != nil {
+					fmt.Fprintf(os.Stderr, "[auto-restart] tcg-snapshot relaunch failed: %v\n", lerr)
+					st.Timeouts.Add(1)
+					break
+				}
+			} else {
+				qemu = launchQemu(ctx, wp)
+				if err := waitForAgent(shmem.Data); err != nil {
+					st.Timeouts.Add(1)
+					break
+				}
 			}
 			progsThisVM = 0
 			consecutiveTimeouts = 0
@@ -274,7 +434,7 @@ func main() {
 			}
 			writeU32(shmem.Data, edk2OffCoverCount, 0)
 			_ = copyFile(*flagOvmfVars, varsCopy)
-			qemu = launchQemu(ctx, varsCopy)
+			qemu = launchQemu(ctx, wp)
 			if err := waitForAgent(shmem.Data); err != nil {
 				st.Timeouts.Add(1)
 				break
@@ -282,14 +442,26 @@ func main() {
 			progsThisVM = 0
 		}
 		var prog *program
+		var sourceProg *progPkg.Prog // the *prog.Prog for corpus storage (grammar mode only)
 		if gt != nil {
-			gp, gerr := gt.generateGrammarProgram(rng)
-			if gerr != nil || gp == nil {
-				// Fall back to hand-rolled random for this iteration
-				// so a single bad sample doesn't kill the campaign.
-				prog = generateProgram(rng)
+			// If a corpus is configured and has entries, prefer mutation
+			// over fresh generation with probability mutateRate.
+			if fc != nil && fc.Len() > 0 && rng.Float64() < *flagMutateRate {
+				wire, pp, merr := gt.mutateGrammarProgram(rng, fc)
+				if merr != nil || wire == nil {
+					prog = generateProgram(rng)
+				} else {
+					prog = wire
+					sourceProg = pp
+				}
 			} else {
-				prog = gp
+				wire, pp, gerr := gt.generateGrammarProgramWithProg(rng)
+				if gerr != nil || wire == nil {
+					prog = generateProgram(rng)
+				} else {
+					prog = wire
+					sourceProg = pp
+				}
 			}
 		} else {
 			prog = generateProgram(rng)
@@ -330,7 +502,23 @@ func main() {
 
 		// Reset cover ring on each iteration so we get a per-program count.
 		writeU32(shmem.Data, edk2OffCoverCount, 0)
-		ok := pokeAgent(shmem.Data, prog, *flagPokeTimeout)
+		var ok bool
+		var progPCs []uint64
+		if *flagTcgSnapshot {
+			// Snapshot mode: inject program via fwsnap, RESTORE, wait
+			// for exit. Coverage still comes from SyzCoverLib's PC ring.
+			// TCG is 10-50x slower than KVM, so bump the per-iteration
+			// budget well above the KVM poke timeout. We cap at max(30s,
+			// poke-timeout) to keep the fuzz loop responsive if the user
+			// explicitly configures a longer timeout.
+			execTO := *flagPokeTimeout
+			if execTO < 30*time.Second {
+				execTO = 30 * time.Second
+			}
+			ok, progPCs = runSnapshotProgram(fs, prog, shmem.Data, tcgRes.InputPhys, execTO)
+		} else {
+			ok = pokeAgent(shmem.Data, prog, *flagPokeTimeout)
+		}
 		if !ok {
 			st.Timeouts.Add(1)
 			consecutiveTimeouts++
@@ -349,13 +537,35 @@ func main() {
 			continue
 		}
 		consecutiveTimeouts = 0
-		status := readU32(shmem.Data, edk2OffGuestStatus)
+		var status uint32
+		if !*flagTcgSnapshot {
+			status = readU32(shmem.Data, edk2OffGuestStatus)
+		}
 		if status != 0 {
 			st.GuestErrors.Add(1)
 		} else {
 			st.Acks.Add(1)
 		}
-		drainCoverage(shmem.Data, pcSet)
+		// Grab per-program coverage (for corpus decision) and also
+		// merge into the global pcSet. In snapshot mode this was already
+		// populated by runSnapshotProgram.
+		if !*flagTcgSnapshot {
+			progPCs = drainCoverageSlice(shmem.Data)
+		}
+		for _, pc := range progPCs {
+			pcSet[pc] = struct{}{}
+		}
+		st.UniqueCovPCs.Store(uint64(len(pcSet)))
+		// If this program hit new coverage, save it in the corpus.
+		if fc != nil && sourceProg != nil && len(progPCs) > 0 {
+			if fc.MaybeAdd(sourceProg, progPCs) {
+				// New corpus entry — log it.
+				if *flagVerbose {
+					fmt.Fprintf(os.Stderr, "[corpus] +1 (size=%d pcs=%d)\n",
+						fc.Len(), fc.TotalPCs())
+				}
+			}
+		}
 		if *flagVerbose {
 			fmt.Fprintf(os.Stderr, "[poke %d] ncalls=%d status=%d cov=%d\n",
 				st.Programs.Load(), prog.NumCalls, status, len(pcSet))
@@ -373,24 +583,49 @@ func main() {
 	}
 	st.UniqueCovPCs.Store(uint64(len(pcSet)))
 
+	// Save corpus one last time before shutting down.
+	if fc != nil {
+		if err := fc.Save(); err != nil {
+			fmt.Fprintf(os.Stderr, "[corpus] final save warning: %v\n", err)
+		}
+	}
+
 	// Stop QEMU and parse crash titles from the debug log.
 	cancel()
 	_ = qemu.Process.Kill()
 	_, _ = qemu.Process.Wait()
 	crashes := scanDebugLog(*flagOvmfDebug)
 
+	covPCs := st.UniqueCovPCs.Load()
+	var covPct float64
+	if *flagTotalFuncs > 0 {
+		covPct = float64(covPCs) / float64(*flagTotalFuncs) * 100
+	}
 	res := runResult{
 		Programs:        st.Programs.Load(),
 		Acks:            st.Acks.Load(),
 		Timeouts:        st.Timeouts.Load(),
 		GuestErrors:     st.GuestErrors.Load(),
 		CallsDispatched: st.Calls.Load(),
-		UniqueCoverPCs:  st.UniqueCovPCs.Load(),
+		UniqueCoverPCs:  covPCs,
+		TotalFuncs:      *flagTotalFuncs,
+		CoveragePercent: covPct,
 		DurationSec:     time.Since(st.StartedAt).Seconds(),
 		BootDurationSec: float64(st.BootDurationMs) / 1000.0,
 		CrashTitles:     crashes,
 		OK:              st.Programs.Load() > 0 && st.Acks.Load() > 0,
 	}
+	// Final summary to stderr so it's always visible.
+	if *flagTotalFuncs > 0 {
+		fmt.Fprintf(os.Stderr,
+			"\n[done] %d programs, %d acks, %d crashes, coverage: %d/%d PCs (%.1f%%)\n",
+			res.Programs, res.Acks, len(crashes), covPCs, *flagTotalFuncs, covPct)
+	} else {
+		fmt.Fprintf(os.Stderr,
+			"\n[done] %d programs, %d acks, %d crashes, coverage: %d unique PCs\n",
+			res.Programs, res.Acks, len(crashes), covPCs)
+	}
+
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(&res)
@@ -657,15 +892,87 @@ func drainCoverage(data []byte, set map[uint64]struct{}) {
 	}
 }
 
+// drainCoverageSlice is like drainCoverage but returns the per-program
+// PC list instead of merging into a global set. Used by the corpus
+// manager to decide which programs hit new coverage.
+func drainCoverageSlice(data []byte) []uint64 {
+	count := readU32(data, edk2OffCoverCount)
+	if count == 0 {
+		return nil
+	}
+	if count > 0x10000 {
+		count = 0x10000
+	}
+	pcs := make([]uint64, 0, count)
+	for i := uint32(0); i < count; i++ {
+		off := edk2OffCoverPcs + i*8
+		pc := binary.LittleEndian.Uint64(data[off : off+8])
+		if pc != 0 {
+			pcs = append(pcs, pc)
+		}
+	}
+	return pcs
+}
+
 // ---------- QEMU launch ----------
 
-func launchQemu(ctx context.Context, varsCopy string) *exec.Cmd {
-	// Create a fuzz disk for BlockIo/DiskIo targets.
-	diskPath := filepath.Join(*flagWorkdir, "fuzz-disk.img")
+// workerPaths holds per-worker file paths when running in multi-job mode.
+type workerPaths struct {
+	workdir  string
+	shmem    string
+	varsCopy string
+	debugLog string
+}
+
+// newWorkerPaths initializes per-worker paths. jobID 0 uses the base
+// paths (for backward-compat with single-job mode); jobID>0 uses a
+// subdir named "worker-N".
+func newWorkerPaths(jobID int) *workerPaths {
+	if jobID == 0 {
+		return &workerPaths{
+			workdir:  *flagWorkdir,
+			shmem:    *flagShmem,
+			varsCopy: filepath.Join(*flagWorkdir, "OVMF_VARS.fd"),
+			debugLog: *flagOvmfDebug,
+		}
+	}
+	wd := filepath.Join(*flagWorkdir, fmt.Sprintf("worker-%d", jobID))
+	os.MkdirAll(wd, 0o755)
+	return &workerPaths{
+		workdir:  wd,
+		shmem:    filepath.Join(wd, "syz-edk2.shm"),
+		varsCopy: filepath.Join(wd, "OVMF_VARS.fd"),
+		debugLog: filepath.Join(wd, "edk2-debug.log"),
+	}
+}
+
+func launchQemu(ctx context.Context, wp *workerPaths) *exec.Cmd {
+	// Create disk images for protocol method fuzzing.
+	diskPath := filepath.Join(wp.workdir, "fuzz-disk.img")
 	if df, err := os.Create(diskPath); err == nil {
 		df.Truncate(64 << 20)
 		df.Close()
 	}
+	sataPath := filepath.Join(wp.workdir, "sata-disk.img")
+	if df, err := os.Create(sataPath); err == nil {
+		df.Truncate(64 << 20)
+		df.Close()
+	}
+	nvmePath := filepath.Join(wp.workdir, "nvme-disk.img")
+	if df, err := os.Create(nvmePath); err == nil {
+		df.Truncate(64 << 20)
+		df.Close()
+	}
+	sdPath := filepath.Join(wp.workdir, "sd-disk.img")
+	if df, err := os.Create(sdPath); err == nil {
+		df.Truncate(64 << 20)
+		df.Close()
+	}
+	fatDir := filepath.Join(wp.workdir, "fatdir")
+	os.MkdirAll(fatDir, 0o755)
+	os.WriteFile(filepath.Join(fatDir, "test.txt"), []byte("syzkaller fuzz test file\n"), 0o644)
+	os.WriteFile(filepath.Join(fatDir, "data.bin"), make([]byte, 4096), 0o644)
+
 	args := []string{
 		"-machine", "q35,accel=kvm",
 		"-cpu", "host",
@@ -675,19 +982,47 @@ func launchQemu(ctx context.Context, varsCopy string) *exec.Cmd {
 		"-nographic",
 		"-serial", "null",
 		"-drive", "if=pflash,format=raw,readonly=on,file=" + *flagOvmfCode,
-		"-drive", "if=pflash,format=raw,file=" + varsCopy,
-		"-debugcon", "file:" + *flagOvmfDebug,
+		"-drive", "if=pflash,format=raw,file=" + wp.varsCopy,
+		"-debugcon", "file:" + wp.debugLog,
 		"-global", "isa-debugcon.iobase=0x402",
-		"-object", fmt.Sprintf("memory-backend-file,id=syzcov,share=on,mem-path=%s,size=256M", *flagShmem),
+		"-object", fmt.Sprintf("memory-backend-file,id=syzcov,share=on,mem-path=%s,size=256M", wp.shmem),
 		"-device", "ivshmem-plain,memdev=syzcov",
-		// Devices so protocol method fuzzing has real targets:
 		"-device", "VGA",
 		"-netdev", "user,id=net0",
 		"-device", "virtio-net-pci,netdev=net0",
 		"-drive", fmt.Sprintf("if=none,id=disk0,format=raw,file=%s", diskPath),
 		"-device", "virtio-blk-pci,drive=disk0",
+		"-device", "ich9-ahci,id=ahci",
+		"-drive", fmt.Sprintf("if=none,id=sata0,format=raw,file=%s", sataPath),
+		"-device", "ide-hd,drive=sata0,bus=ahci.0",
+		"-drive", fmt.Sprintf("if=none,id=nvme0,format=raw,file=%s", nvmePath),
+		"-device", "nvme,serial=syzfuzz0001,drive=nvme0",
+		"-drive", fmt.Sprintf("if=none,id=fatdisk,format=raw,file=fat:rw:%s", fatDir),
+		"-device", "virtio-blk-pci,drive=fatdisk",
+		// SD/MMC card via sdhci PCI controller
+		"-device", "sdhci-pci,id=sdhci",
+		"-drive", fmt.Sprintf("if=none,id=sddrv,format=raw,file=%s", sdPath),
+		"-device", "sd-card,drive=sddrv",
+		// USB xHCI with tablet + keyboard for multiple UsbIo device instances
 		"-device", "qemu-xhci,id=xhci",
 		"-device", "usb-tablet,bus=xhci.0",
+		"-device", "usb-kbd,bus=xhci.0",
+		// Second NIC using e1000 (different driver from virtio-net)
+		"-netdev", "user,id=net1",
+		"-device", "e1000,netdev=net1",
+		"-device", "isa-serial,chardev=ser0",
+		"-chardev", "null,id=ser0",
+	}
+	// Wire up an HMP monitor on a TCP socket so warm-reset can send
+	// system_reset without killing QEMU. Only enabled when the user
+	// asked for it; the monitor adds a small amount of startup cost.
+	if *flagWarmReset {
+		if *flagMonitorPort == 0 {
+			*flagMonitorPort = allocateMonitorPort()
+		}
+		args = append(args,
+			"-monitor", fmt.Sprintf("tcp:127.0.0.1:%d,server,nowait", *flagMonitorPort),
+		)
 	}
 	cmd := exec.CommandContext(ctx, *flagQemu, args...)
 	cmd.Stdout = nil

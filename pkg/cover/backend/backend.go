@@ -80,6 +80,11 @@ func Make(cfg *mgrconfig.Config, modules []*vminfo.KernelModule) (*Impl, error) 
 	if vm == targets.GVisor {
 		return makeGvisor(target, kernelDirs, modules)
 	}
+	if target.OS == targets.EDK2 {
+		// EDK2 DXE modules are standard ELF binaries with DWARF debug
+		// info (the Build/.../X64/*.dll files). Reuse the ELF backend.
+		return makeELF(target, kernelDirs, nil, moduleObj, modules)
+	}
 	var delimiters []string
 	if cfg.AndroidSplitBuild {
 		// Path prefixes used by Android Pixel kernels. See
@@ -93,6 +98,11 @@ func Make(cfg *mgrconfig.Config, modules []*vminfo.KernelModule) (*Impl, error) 
 func GetPCBase(cfg *mgrconfig.Config) (uint64, error) {
 	if cfg.Target.OS == targets.Linux && cfg.Type != targets.GVisor && cfg.Type != targets.Starnix {
 		return getLinuxPCBase(cfg)
+	}
+	if cfg.Target.OS == targets.EDK2 {
+		// EDK2 DXE drivers are loaded at absolute addresses (no KASLR).
+		// PCs are already absolute, so base is 0.
+		return 0, nil
 	}
 	return 0, nil
 }

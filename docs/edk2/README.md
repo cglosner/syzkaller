@@ -60,9 +60,9 @@ The build output is in `Build/OvmfX64/NOOPT_GCC5/FV/`:
 - `OVMF_CODE.fd` - firmware code (read-only pflash)
 - `OVMF_VARS.fd` - variable store template (copied per-VM)
 
-### Optional: ASan/UBSan instrumentation
+### Recommended: full sanitizer build
 
-To enable AddressSanitizer for DXE modules (heap, stack, globals):
+Build OVMF with every sanitizer enabled:
 
 ```bash
 build -p OvmfPkg/OvmfPkgX64.dsc -a X64 -t GCC5 -b NOOPT \
@@ -74,8 +74,45 @@ build -p OvmfPkg/OvmfPkgX64.dsc -a X64 -t GCC5 -b NOOPT \
     -n $(nproc)
 ```
 
-ASan shadow memory is backed by the ivshmem region (offset `0x200000`),
-so it doesn't consume firmware RAM.
+Coverage:
+
+- **ASan** (`-fsanitize=kernel-address --param asan-stack=1 --param asan-globals=1`)
+  on every `DXE_DRIVER`, `UEFI_DRIVER`, `DXE_RUNTIME_DRIVER`,
+  `UEFI_APPLICATION`, `DXE_CORE`, and `DXE_SMM_DRIVER` (99 of 110 DXE
+  modules). Detects heap/stack/global OOB and use-after-free. Shadow
+  lives in reserved DRAM at `0x30000000` (256 MB covering the low 2 GB).
+- **UBSan** (`-fsanitize=undefined -fsanitize=pointer-overflow
+  -fno-sanitize=alignment`) on the same module set. Detects signed
+  integer overflow, shift out-of-bounds, array bounds, pointer
+  overflow.
+- **MMIOConstraintSan** (always on when `SYZ_AGENT_ENABLE=TRUE`).
+  Validates every `cpu_io_mem_*` syscall target address against
+  declared GCD MMIO regions.
+- **ProtocolLifetimeSan** (always on). Hooks `UninstallProtocolInterface`
+  and poisons interface memory so subsequent uses fire ASan UAF.
+- **SMIBVS** (inert unless `-D SMM_REQUIRE=TRUE`). SMI CommBuffer
+  validator — rejects pointers into SMRAM.
+
+See `MdeModulePkg/Library/AsanLib/README.md` in the edk2 tree for the
+firmware-side design details.
+
+### Disabling a sanitizer for a single run
+
+```bash
+# ASan off, UBSan on
+build ... -D ASAN_INSTRUMENT=FALSE -D UBSAN_INSTRUMENT=TRUE
+
+# All off (production-style build with SyzAgent only)
+build ... -D ASAN_INSTRUMENT=FALSE -D UBSAN_INSTRUMENT=FALSE
+```
+
+### Carveouts
+
+`PciBusDxe` and `PciHostBridgeDxe` are explicitly opted out of ASan
+per-component in `OvmfPkg/OvmfPkgX64.dsc`. PCI enumeration is
+O(devices × MMIO-ops) and ASan-instrumenting it stalls TCG boot for
+minutes. Target drivers (Fat, Ip4Dxe, Tcp4Dxe, etc.) remain fully
+instrumented.
 
 ## Building syzkaller
 
@@ -137,6 +174,90 @@ bin/syz-manager -config edk2-manager.cfg
 
 Open the web UI at `http://localhost:56741`. If running on a remote server,
 tunnel the port: `ssh -L 56741:localhost:56741 your-server`.
+
+## End-to-end example: full-sanitizer fwsnap campaign
+
+Clone, build, and launch a TCG-snapshot fuzzing campaign with every
+sanitizer active:
+
+```bash
+# 1. Check out the two repos side by side
+git clone git@github.com:cglosner/edk2.git edk2-syzkaller
+git -C edk2-syzkaller checkout syzkaller-edk2
+git -C edk2-syzkaller submodule update --init --recursive
+git clone git@github.com:cglosner/syzkaller.git syzkaller
+
+# 2. Build OVMF with full sanitizer coverage
+cd edk2-syzkaller
+make -C BaseTools -j$(nproc)
+export GCC5_BIN=$PWD/BaseTools/BinWrappers/PosixLike/gcc-wrap/
+. ./edksetup.sh
+build -p OvmfPkg/OvmfPkgX64.dsc -a X64 -t GCC5 -b NOOPT \
+      -D SYZ_AGENT_ENABLE=TRUE -D ASAN_ENABLE=TRUE \
+      -D ASAN_INSTRUMENT=TRUE -D UBSAN_INSTRUMENT=TRUE \
+      -D FD_SIZE_IN_KB=8192 -n $(nproc)
+
+# 3. Build syzkaller manager + target + host-native executor
+cd ../syzkaller
+CI=true ./tools/syz-env make manager
+CI=true ./tools/syz-env make TARGETOS=edk2 TARGETARCH=amd64 TARGETVMARCH=amd64 target
+GIT_REV=$(git rev-parse HEAD)$(git diff --quiet || echo +)
+clang++ -o bin/edk2_amd64/syz-executor executor/executor.cc \
+    -m64 -O2 -pthread -Wall -Wno-array-bounds \
+    -Wno-unused-but-set-variable -Wno-unused-command-line-argument \
+    -std=c++17 -I. -Iexecutor/_include \
+    -DGOOS_edk2=1 -DGOARCH_amd64=1 -DHOSTGOOS_linux=1 \
+    "-DGIT_REVISION=\"${GIT_REV}\""
+
+# 4. Build qemu-fwfuzz (once) — plugins/libfwsnap.so is used by fwsnap mode
+git clone -b dev/firmware-fuzz-coverage https://github.com/cglosner/qemu.git qemu-fwfuzz
+cd qemu-fwfuzz
+./configure --target-list=x86_64-softmmu --disable-werror --disable-docs \
+            --disable-tools --disable-gtk --disable-vnc --enable-plugins
+make -j$(nproc) qemu-system-x86_64 contrib/plugins/libfwsnap.so
+mv build build-fwfuzz
+
+# 5. Create a manager config (save as edk2-manager-fwsnap.cfg)
+cd ../syzkaller
+cat > tools/syz-edk2-fuzz/edk2-manager-fwsnap.cfg <<EOF
+{
+  "name": "edk2-fwsnap",
+  "target": "edk2/amd64",
+  "http": "localhost:56755",
+  "workdir": "$(pwd)/workdir-edk2-fwsnap",
+  "syzkaller": "$(pwd)",
+  "kernel_obj": "$(pwd)/../edk2-syzkaller/Build/OvmfX64/NOOPT_GCC5/X64",
+  "kernel_src": "$(pwd)/../edk2-syzkaller",
+  "kernel_build_src": "$(pwd)/../edk2-syzkaller",
+  "image": "/tmp/syz-edk2-ovmf-vars.fd",
+  "procs": 1,
+  "sandbox": "none",
+  "type": "qemu",
+  "cover": true,
+  "reproduce": false,
+  "enable_syscalls": ["syz_mmap", "syz_edk2_run_program"],
+  "vm": {
+    "count": 1,
+    "cpu": 1,
+    "mem": 1024,
+    "qemu": "qemu-system-x86_64",
+    "tcg_snapshot": true,
+    "qemu_fwfuzz": "$(pwd)/../qemu-fwfuzz/build-fwfuzz/qemu-system-x86_64",
+    "efi_code_device": "$(pwd)/../edk2-syzkaller/Build/OvmfX64/NOOPT_GCC5/FV/OVMF_CODE.fd",
+    "efi_vars_device": "/tmp/syz-edk2-ovmf-vars.fd"
+  }
+}
+EOF
+cp ../edk2-syzkaller/Build/OvmfX64/NOOPT_GCC5/FV/OVMF_VARS.fd /tmp/syz-edk2-ovmf-vars.fd
+
+# 6. Launch
+./bin/syz-manager -config tools/syz-edk2-fuzz/edk2-manager-fwsnap.cfg
+```
+
+Watch the web UI at http://localhost:56755 for `corpus`, `coverage`,
+and `crashes`. First boot takes 5-10 minutes (ASan-instrumented OVMF
+under TCG) to reach the snapshot point; subsequent fuzz iterations
+restore from the snapshot and execute at 100+/min.
 
 ## Running with syz-edk2-fuzz (standalone)
 

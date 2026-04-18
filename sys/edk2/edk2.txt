@@ -1180,6 +1180,131 @@ edk2_api_load_image {
 	data_length	int32[0:65536]
 } [packed]
 
+# ----------------------------------------------------------------------
+# PE/COFF image fuzzing — exercises DxeCore's PE32+ image loader via
+# gBS->LoadImage with a fuzzer-crafted image inline. The EDK2 image
+# loader walks every field below by hand (see MdePkg/Library/
+# BasePeCoffLib/BasePeCoff.c) and has historically been a rich bug
+# source — unchecked NumberOfRvaAndSizes, overlapping sections, bogus
+# e_lfanew, SizeOfImage < header size, etc.
+#
+# Layout matches PE32+ exactly so the loader walks real parser paths.
+# All length/offset fields are left fuzzer-controlled; signatures
+# and magic values are pinned to maximize the fraction of programs
+# that make it past early-reject filters into the real parsing code.
+# ----------------------------------------------------------------------
+
+edk2_api_load_image_pe {
+	boot_policy	int8[0:1]
+	pad0		const[0, int8]
+	pad1		const[0, int16]
+	image		edk2_pe_image
+} [packed]
+
+edk2_pe_image {
+	dos		edk2_pe_dos_header
+	coff		edk2_pe_coff_header
+	opt		edk2_pe_opt_header
+	data_dirs	edk2_pe_data_dirs
+	sections	array[edk2_pe_section, 0:4]
+	trailing	array[int8, 0:1024]
+} [packed]
+
+edk2_pe_dos_header {
+	e_magic		const[0x5A4D, int16]
+	e_cblp		int16
+	e_cp		int16
+	e_crlc		int16
+	e_cparhdr	int16
+	e_minalloc	int16
+	e_maxalloc	int16
+	e_ss		int16
+	e_sp		int16
+	e_csum		int16
+	e_ip		int16
+	e_cs		int16
+	e_lfarlc	int16
+	e_ovno		int16
+	e_res		array[int16, 4]
+	e_oemid		int16
+	e_oeminfo	int16
+	e_res2		array[int16, 10]
+	e_lfanew	int32
+} [packed]
+
+edk2_pe_coff_header {
+	pe_sig		const[0x00004550, int32]
+	machine		flags[edk2_pe_machine, int16]
+	num_sections	int16[0:96]
+	timestamp	int32
+	ptr_symtab	int32
+	num_symbols	int32
+	size_opt_hdr	int16
+	characteristics	flags[edk2_pe_coff_chars, int16]
+} [packed]
+
+edk2_pe_machine = 0x8664, 0x014c, 0xAA64, 0x01c0, 0x0200
+
+edk2_pe_coff_chars = 0x0001, 0x0002, 0x0020, 0x0100, 0x1000, 0x2000, 0x4000
+
+edk2_pe_opt_header {
+	magic		flags[edk2_pe_opt_magic, int16]
+	major_linker	int8
+	minor_linker	int8
+	size_code	int32
+	size_init_data	int32
+	size_uninit	int32
+	entry_point	int32
+	base_code	int32
+	image_base	int64
+	section_align	int32
+	file_align	int32
+	major_os	int16
+	minor_os	int16
+	major_image	int16
+	minor_image	int16
+	major_subsys	int16
+	minor_subsys	int16
+	win32_ver	int32
+	size_image	int32
+	size_headers	int32
+	checksum	int32
+	subsystem	flags[edk2_pe_subsystem, int16]
+	dll_chars	int16
+	stack_reserve	int64
+	stack_commit	int64
+	heap_reserve	int64
+	heap_commit	int64
+	loader_flags	int32
+	num_rva_sizes	int32[0:32]
+} [packed]
+
+edk2_pe_opt_magic = 0x020B, 0x010B
+
+edk2_pe_subsystem = 10, 11, 12, 13
+
+edk2_pe_data_dirs {
+	entries		array[edk2_pe_data_dir, 16]
+} [packed]
+
+edk2_pe_data_dir {
+	virtual_address	int32
+	size		int32
+} [packed]
+
+edk2_pe_section {
+	name		array[int8, 8]
+	virtual_size	int32
+	virtual_address	int32
+	size_raw_data	int32
+	pointer_raw_data int32
+	pointer_relocs	int32
+	pointer_linenums int32
+	num_relocs	int16
+	num_linenums	int16
+	characteristics	int32
+} [packed]
+
 edk2_api_start_image {
 	image_handle_index	edk2_image_slot
 } [packed]
@@ -1441,6 +1566,7 @@ syz_edk2_call [
 	unload_image			syz_edk2_api[792, edk2_api_unload_image]
 	connect_controller		syz_edk2_api[793, edk2_api_connect_controller]
 	disconnect_controller		syz_edk2_api[794, edk2_api_disconnect_controller]
+	load_image_pe			syz_edk2_api[795, edk2_api_load_image_pe]
 	smi_trigger			syz_edk2_api[800, edk2_api_smi_trigger]
 	smm_communicate			syz_edk2_api[801, edk2_api_smm_communicate]
 	cpu_io_port_read		syz_edk2_api[810, edk2_api_cpu_io_port_read]
@@ -1604,6 +1730,7 @@ syz_edk2_run_program$start_image(prog ptr[in, edk2_prog1[791, edk2_api_start_ima
 syz_edk2_run_program$unload_image(prog ptr[in, edk2_prog1[792, edk2_api_unload_image]])
 syz_edk2_run_program$connect_controller(prog ptr[in, edk2_prog1[793, edk2_api_connect_controller]])
 syz_edk2_run_program$disconnect_controller(prog ptr[in, edk2_prog1[794, edk2_api_disconnect_controller]])
+syz_edk2_run_program$load_image_pe(prog ptr[in, edk2_prog1[795, edk2_api_load_image_pe]]) edk2_image_slot
 syz_edk2_run_program$smi_trigger(prog ptr[in, edk2_prog1[800, edk2_api_smi_trigger]])
 syz_edk2_run_program$smm_communicate(prog ptr[in, edk2_prog1[801, edk2_api_smm_communicate]])
 syz_edk2_run_program$cpu_io_port_read(prog ptr[in, edk2_prog1[810, edk2_api_cpu_io_port_read]])

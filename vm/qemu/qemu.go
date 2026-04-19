@@ -793,7 +793,10 @@ func (inst *instance) boot() error {
 // and poll for the guest ack — the same handshake syz-edk2-fuzz uses.
 func (inst *instance) waitForAgentReady(bootOutput []byte, stop chan bool) error {
 	shmPath := filepath.Join(inst.workdir, "template", "syz-edk2.shm")
-	deadline := time.Now().Add(2 * time.Minute * inst.timeouts.Scale)
+	// Full-sanitizer OVMF + virtio devices under TCG takes 5-8 minutes
+	// to reach SyzFwfuzzTrigger. 15 min deadline so slower hosts don't
+	// spin in a boot-retry loop.
+	deadline := time.Now().Add(15 * time.Minute * inst.timeouts.Scale)
 	var hostSeq uint32
 	for time.Now().Before(deadline) {
 		f, err := os.OpenFile(shmPath, os.O_RDWR|os.O_SYNC, 0)

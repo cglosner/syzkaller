@@ -138,6 +138,12 @@ clang++ -o bin/edk2_amd64/syz-executor executor/executor.cc \
 Building it inside `syz-env` produces a binary linked against a newer glibc
 that may not be available on the host.
 
+**Re-running `make target` or `make manager` inside `syz-env` will
+overwrite the executor** with the container's glibc-2.38-linked copy
+and the manager will immediately error with `GLIBC_2.38 not found`.
+If you hit that after any grammar or manager rebuild, re-run the
+native `clang++` line above.
+
 ## Running with syz-manager
 
 Create a config file (e.g. `edk2-manager.cfg`):

@@ -79,6 +79,42 @@ func (ctx *edk2) Symbolize(rep *Report) error {
 	var symbolized []byte
 	symbolized = append(symbolized, rep.Report...)
 	seen := make(map[string]bool)
+
+	//
+	// If the crash is an X64 exception, also symbolize every general
+	// register whose value lands inside a loaded module. A #GP at
+	// unmapped RIP often leaves the CALLER's address in one of the
+	// saved registers (RBX, R10, R12, R13, R14), and those are what
+	// actually identify the guilty driver.
+	//
+	regRe := regexp.MustCompile(`R(?:AX|BX|CX|DX|SI|DI|BP|SP|8|9|10|11|12|13|14|15|IP)\s*-\s*(0x[0-9A-Fa-f]+)`)
+	for _, m := range regRe.FindAllSubmatch(rep.Output, -1) {
+		pcStr := string(m[1])
+		if seen[pcStr] {
+			continue
+		}
+		seen[pcStr] = true
+		pc, err := strconv.ParseUint(strings.TrimPrefix(pcStr, "0x"), 16, 64)
+		if err != nil || pc < 0x100000 {
+			continue
+		}
+		mod := edk2FindModule(modules, pc)
+		if mod == nil {
+			continue
+		}
+		offset := pc - mod.Base
+		debugPath := edk2FindDebugFile(ctx.kernelDirs.Obj, mod.Name)
+		if debugPath == "" {
+			continue
+		}
+		info := edk2Addr2Line(debugPath, offset)
+		if info == "" {
+			continue
+		}
+		symbolized = append(symbolized,
+			[]byte(fmt.Sprintf("  reg %s => in %s+0x%x => %s\n", pcStr, mod.Name, offset, info))...)
+	}
+
 	for _, match := range edk2PcPattern.FindAllSubmatch(rep.Report, -1) {
 		pcStr := string(match[1])
 		if seen[pcStr] {
@@ -105,6 +141,15 @@ func (ctx *edk2) Symbolize(rep *Report) error {
 		symbolized = append(symbolized,
 			[]byte(fmt.Sprintf("  in %s+0x%x => %s\n", mod.Name, offset, info))...)
 	}
+	//
+	// Append the "last executing test programs" block (if present).
+	// This is normally saved to log0 separately but pulling it into
+	// the symbolized report makes triage a single-file operation.
+	//
+	if m := edk2LastProgramsRe.FindSubmatch(rep.Output); m != nil {
+		symbolized = append(symbolized, []byte("\n\n")...)
+		symbolized = append(symbolized, m[0]...)
+	}
 	rep.Report = symbolized
 	return nil
 }
@@ -125,7 +170,23 @@ var (
 	edk2ProtectImageRe = regexp.MustCompile(
 		`ProtectUefiImageCommon - 0x[0-9A-Fa-f]+\s*\n` +
 			`\s*- 0x([0-9A-Fa-f]+) - 0x([0-9A-Fa-f]+)`)
-	edk2PcPattern = regexp.MustCompile(`at pc (0x[0-9A-Fa-f]+)`)
+	//
+	// Matches both ASan/UBSan "at pc 0x..." and the CpuExceptionHandlerLib
+	// register dump lines ("RIP - 0x...", "RSP - 0x..."). Any PC the host
+	// can place inside a loaded module gets addr2line'd and appended to
+	// the report. For the common "#GP at RIP=low-memory" case this lets
+	// us symbolize the CALLER by scanning RSP+N values in the dump.
+	//
+	edk2PcPattern = regexp.MustCompile(
+		`(?:at pc |RIP  - |RIP - |R10  - |R10 - )(0x[0-9A-Fa-f]+)`)
+	//
+	// "last executing test programs" — syzkaller's VM output includes
+	// a history of recently-executed fuzz programs above the crash
+	// site. Copy this verbatim into the report so triage doesn't need
+	// to cross-reference log0 → report0 manually.
+	//
+	edk2LastProgramsRe = regexp.MustCompile(
+		`(?s)last executing test programs:.*?(?:\n\nkernel console output|$)`)
 )
 
 // edk2ParseLoadedModules scans the QEMU debug log for module load

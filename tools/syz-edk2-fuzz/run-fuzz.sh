@@ -111,6 +111,7 @@ if [[ "${SKIP_BUILD}" == "0" ]]; then
             -D SYZ_AGENT_ENABLE=TRUE -D ASAN_ENABLE=TRUE \
             -D ASAN_INSTRUMENT='"${ASAN_INSTRUMENT:-FALSE}"' \
             -D UBSAN_INSTRUMENT='"${UBSAN_INSTRUMENT:-FALSE}"' \
+            -D SYZ_BUGS_DISPATCH_INJECT='"${SYZ_BUGS_DISPATCH_INJECT:-FALSE}"' \
             '"${extra_build_args}"' -n '"$(nproc)" ) \
         > "${WORKDIR}/edk2-build.log" 2>&1 \
         || { tail -30 "${WORKDIR}/edk2-build.log"; die "OVMF build failed"; }

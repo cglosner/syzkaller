@@ -74,9 +74,80 @@ func (ctx *edk2) Symbolize(rep *Report) error {
 		}
 	}
 
+	//
+	// Prepend a structured CRASH SUMMARY block before the raw report.
+	// The web UI shows the first N chars of rep.Report prominently,
+	// so putting the most-actionable info there means triagers don't
+	// need to scroll through debugcon noise to find module/file/line.
+	//
+	var summary []byte
+	primaryPC := ""
+	primaryKind := ""
+	if m := regexp.MustCompile(`==ERROR: AddressSanitizer: ([a-zA-Z0-9_-]+) on address (0x[0-9a-fA-F]+) at pc (0x[0-9a-fA-F]+)`).FindSubmatch(rep.Output); m != nil {
+		primaryKind = string(m[1])
+		primaryPC = string(m[3])
+		summary = append(summary, []byte(fmt.Sprintf(
+			"CRASH SUMMARY: ASan %s\n  Fault address: %s\n  Faulting PC:   %s\n",
+			primaryKind, m[2], primaryPC))...)
+	} else if m := regexp.MustCompile(`X64 Exception Type - ([0-9A-F]+)\([^)]+\)[^\n]*\n(?s:.*?)RIP  - (0x[0-9a-fA-F]+|[0-9A-F]+)`).FindSubmatch(rep.Output); m != nil {
+		primaryPC = string(m[2])
+		if !strings.HasPrefix(primaryPC, "0x") {
+			primaryPC = "0x" + primaryPC
+		}
+		primaryKind = "X64-exception-" + string(m[1])
+		summary = append(summary, []byte(fmt.Sprintf(
+			"CRASH SUMMARY: %s\n  Faulting PC: %s\n",
+			primaryKind, primaryPC))...)
+	} else if m := regexp.MustCompile(`ASSERT \[([A-Za-z0-9_]+)\] ([^:\r\n]+):(\d+)`).FindSubmatch(rep.Output); m != nil {
+		summary = append(summary, []byte(fmt.Sprintf(
+			"CRASH SUMMARY: DebugLib ASSERT\n  Module: %s\n  Source: %s:%s\n",
+			string(m[1]), string(m[2]), string(m[3])))...)
+	}
+
+	// Symbolize the primary PC for the title + summary.
+	if primaryPC != "" {
+		pc, err := strconv.ParseUint(strings.TrimPrefix(primaryPC, "0x"), 16, 64)
+		if err == nil {
+			if mod := edk2FindModule(modules, pc); mod != nil {
+				offset := pc - mod.Base
+				summary = append(summary, []byte(fmt.Sprintf(
+					"  Module: %s.efi (base=0x%x +0x%x)\n",
+					mod.Name, mod.Base, offset))...)
+				if debugPath := edk2FindDebugFile(ctx.kernelDirs.Obj, mod.Name); debugPath != "" {
+					if info := edk2Addr2Line(debugPath, offset); info != "" {
+						summary = append(summary, []byte(fmt.Sprintf(
+							"  Function: %s\n", info))...)
+						// Promote function+line into the crash title so the
+						// web UI main listing shows "edk2: ASan: heap-oob in
+						// CoreAllocatePool at Pool.c:266" instead of just
+						// "edk2: ASan: heap-buffer-overflow at ADDR...".
+						rep.Title = fmt.Sprintf("edk2: %s in %s (%s)",
+							primaryKind, mod.Name, info)
+						// GuiltyFile lets syzkaller's dashboard bucketize
+						// by the offending source file.
+						if parts := regexp.MustCompile(` at (.+):(\d+)$`).FindStringSubmatch(info); len(parts) == 3 {
+							rep.GuiltyFile = parts[1]
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Extract the triggering syscall for the summary.
+	if m := regexp.MustCompile(`syz_edk2_run_program\$([a-z0-9_]+)\(`).FindSubmatch(rep.Output); m != nil {
+		summary = append(summary, []byte(fmt.Sprintf(
+			"  Trigger: syz_edk2_run_program$%s\n", string(m[1])))...)
+	}
+
+	if len(summary) > 0 {
+		summary = append(summary, []byte("\n")...)
+	}
+
 	// Find every "at pc 0xXXX" occurrence in the report body and
 	// symbolize each.
 	var symbolized []byte
+	symbolized = append(symbolized, summary...)
 	symbolized = append(symbolized, rep.Report...)
 	seen := make(map[string]bool)
 

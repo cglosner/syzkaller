@@ -164,11 +164,11 @@ edk2_efi_time {
 # wCertificateType=0x0EF1 is EFI_CERT_TYPE_PKCS7_GUID, 0x0EF2 is
 # the AMD-specific variant; both stress the type dispatch.
 edk2_win_certificate_uefi_guid {
-	dwLength		int32[0:4096]
+	dwLength		int32[0:8192]
 	wRevision		int16[0x0200:0x0201]
 	wCertificateType	int16[0x0EF1:0x0EF2]
 	cert_type		array[int8, 16]
-	cert_data		array[int8, 0:256]
+	cert_data		array[int8, 0:4096]
 } [packed]
 
 edk2_api_get_variable {
@@ -374,7 +374,7 @@ edk2_protocol_id = EDK2_PROTO_LOADED_IMAGE, EDK2_PROTO_DEVICE_PATH, EDK2_PROTO_B
 # ----------------------------------------------------------------------
 edk2_api_hii_new_package_list {
 	package_size	bytesize[data, int16]
-	data		array[int8, 4:512]
+	data		array[int8, 4:32768]
 } [packed]
 
 edk2_api_hii_remove_package_list {
@@ -477,7 +477,7 @@ edk2_api_hii_update_package_list {
 	handle_index	int32[0:15]
 	package_size	bytesize[data, int16]
 	pad0		const[0, int16]
-	data		array[int8, 4:512]
+	data		array[int8, 4:32768]
 } [packed]
 
 edk2_api_hii_export_package_lists {
@@ -619,7 +619,7 @@ edk2_api_hii_new_string {
 	handle_index	int32[0:15]
 	string_size	bytesize[string, int16]
 	pad0		const[0, int16]
-	string		array[int16, 1:64]
+	string		array[int16, 1:8192]
 } [packed]
 
 edk2_api_hii_get_string {
@@ -634,7 +634,7 @@ edk2_api_hii_set_string {
 	string_id	int32[1:256]
 	string_size	bytesize[string, int16]
 	pad0		const[0, int16]
-	string		array[int16, 1:64]
+	string		array[int16, 1:8192]
 } [packed]
 
 edk2_api_hii_get_languages {
@@ -873,7 +873,7 @@ edk2_api_device_path_to_text {
 edk2_api_text_out_output_string {
 	string_size	bytesize[string, int16]
 	pad0		const[0, int16]
-	string		array[int16, 1:64]
+	string		array[int16, 1:8192]
 } [packed]
 
 edk2_api_text_out_set_mode {
@@ -1351,8 +1351,8 @@ edk2_api_smi_trigger {
 # Lenovo ThinkPwn, Dell SmmBde).
 edk2_api_smm_communicate {
 	header_guid	array[int8, 16]
-	message_len	int32[0:512]
-	message		array[int8, 0:512]
+	message_len	int32[0:8192]
+	message		array[int8, 0:8192]
 } [packed]
 
 edk2_io_width = EfiCpuIoWidthUint8, EfiCpuIoWidthUint16, EfiCpuIoWidthUint32, EfiCpuIoWidthUint64, EfiCpuIoWidthFifoUint8, EfiCpuIoWidthFifoUint16, EfiCpuIoWidthFifoUint32, EfiCpuIoWidthFifoUint64, EfiCpuIoWidthFillUint8, EfiCpuIoWidthFillUint16, EfiCpuIoWidthFillUint32, EfiCpuIoWidthFillUint64
@@ -1422,6 +1422,16 @@ edk2_api_smbios_get_next {
 	smbios_type	int8
 	pad0		const[0, int8]
 	pad1		const[0, int32]
+} [packed]
+
+# LogoFAIL-class: raw BMP bytes fed into TranslateBmpToGopBlt. First
+# 4 bytes are a declared length (capped 64 KiB server-side); remaining
+# bytes are the BMP image. Designed to exercise the decoder's header /
+# palette / pixel-array arithmetic, which historically has been a rich
+# bug source (LogoFAIL CVEs).
+edk2_api_bmp_decode {
+	declared_size	int32[0:65536]
+	data		array[int8, 14:32768]
 } [packed]
 
 # The discriminated union of all commands the agent understands. The
@@ -1577,6 +1587,7 @@ syz_edk2_call [
 	msr_write			syz_edk2_api[815, edk2_api_msr_write]
 	smbios_add			syz_edk2_api[820, edk2_api_smbios_add]
 	smbios_get_next			syz_edk2_api[821, edk2_api_smbios_get_next]
+	bmp_decode			syz_edk2_api[900, edk2_api_bmp_decode]
 ] [varlen]
 
 # ----------------------------------------------------------------------
@@ -1741,3 +1752,4 @@ syz_edk2_run_program$msr_read(prog ptr[in, edk2_prog1[814, edk2_api_msr_read]])
 syz_edk2_run_program$msr_write(prog ptr[in, edk2_prog1[815, edk2_api_msr_write]])
 syz_edk2_run_program$smbios_add(prog ptr[in, edk2_prog1[820, edk2_api_smbios_add]])
 syz_edk2_run_program$smbios_get_next(prog ptr[in, edk2_prog1[821, edk2_api_smbios_get_next]])
+syz_edk2_run_program$bmp_decode(prog ptr[in, edk2_prog1[900, edk2_api_bmp_decode]])

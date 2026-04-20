@@ -402,8 +402,50 @@ load map, then uses `addr2line` on the per-module `.dll` files.
 - **SMM fuzzing** is not integrated. SMI handler fuzzing requires a separate
   harness (see `tools/syz-edk2-smi-fuzz/`).
 
+## NVRAM persistence across fwsnap iterations
+
+OVMF_VARS pflash is mapped above 0xFF000000 — well outside the fwsnap
+snapshot region (`0x3C000000:0x04000000` by default, see
+`vm/qemu/fwsnap_edk2.go:buildFwsnapPluginArg`). As a result,
+`SetVariable` writes survive ACROSS iterations within the same VM:
+iteration N writes a variable, iteration N+1 can read it. This is
+"stateful fuzzing" for the variable store.
+
+Persistence across VM restarts (after a crash) is NOT preserved —
+each new VM gets a fresh copy of `OVMF_VARS.fd` from
+`EfiVarsDevice`. That's deliberate (a crashed VM could have left the
+varstore corrupted). To experiment with cross-restart persistence,
+point `EfiVarsDevice` at a long-lived copy and remove the per-VM
+duplicate in `vm/qemu/qemu.go` (search `copyFile(inst.cfg.EfiVarsDevice`).
+
+## Planted-bug validation mode
+
+Build with `-D SYZ_BUGS_DISPATCH_INJECT=TRUE` to enable the 15
+handler tripwires (see `docs/edk2/bug-injection-catalog.md`). Each
+tripwire triggers a deterministic ASan/UBSan primitive in
+`MdeModulePkg/Library/SyzBugsLib/SyzBugsLib.c` when the fuzzer
+reaches the dispatch handler with a specific magic value. Use the
+`tools/syz-edk2-fuzz/plant-seeds/` corpus for deterministic
+validation. Leave `INJECT=FALSE` for production runs.
+
+## Fault trampoline + MMIOCS enforcement
+
+Phase 2 adds two mutes for fuzzer-induced noise:
+- `SyzFaultGuard` (`OvmfPkg/SyzAgentDxe/SyzFaultGuard.c`) installs
+  custom `#DE/#UD/#GP/#PF` handlers + a `SetJump` trampoline.
+  Hardware faults from fuzzer-chosen CpuIo/MSR addresses are trapped
+  and returned as error instead of crashing the firmware.
+- `-D MMIOCS_ENFORCE=TRUE` turns MMIOCS from log-only into
+  enforcing: unresolved MMIO addresses are rejected at the
+  dispatcher before the CPU fires the fault.
+
+Both are on by default in the production build config; disable only
+for debugging noise you're actually chasing.
+
 ## Further reading
 
 - [docs/edk2_design.md](../edk2_design.md) - Detailed design document
 - [docs/edk2_grammar_walkthrough.md](../edk2_grammar_walkthrough.md) - Grammar walkthrough
 - [docs/edk2_asan_handoff.md](../edk2_asan_handoff.md) - ASan Linux kernel handoff plan
+- [docs/edk2/bug-injection-catalog.md](bug-injection-catalog.md) - 15 planted-bug tripwire catalog
+- [docs/edk2/crash-triage.md](crash-triage.md) - Crash triage rounds 1 + 2

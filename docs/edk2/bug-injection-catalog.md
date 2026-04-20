@@ -21,18 +21,29 @@ in seconds rather than hours.
 | 6 | image       | `HandleLoadImage`             | `Length==0xBAD0`                    | integer overflow NumPages*PgSize | UBSan mul-ov / KASan heap-OOB |
 | 7 | protocol    | `HandleLocateProtocol`        | `ProtocolIdx==0xDEADC0DE`           | NULL dereference             | UBSan null / KASan NULL |
 | 8 | block-io    | `HandleBlockIoReadBlocks`     | `BufferSize==0xF00D`                | shadowed-stack OOB           | KASan stack-OOB    |
-| 9 | pci-io      | `HandlePciIoMemWrite`         | `Count==0x1337`                     | shift-out-of-bounds          | UBSan shift        |
-| 10| network     | `HandleIp4Transmit`           | `BufferSize==0xFEED`                | heap-OOB read (hdr parse)    | KASan heap-OOB     |
-| 11| graphics    | `HandleGopBlt`                | `Width==0xABBA`                     | mul-overflow Width*Height    | UBSan mul-ov       |
-| 12| hii         | `HandleHiiNewPackageList`     | `PackageSize==0xB00F`               | heap-OOB read past header    | KASan heap-OOB     |
-| 13| smbios      | `HandleSmbiosAdd`             | (unchanged — already TP from §1)    | heap-OOB `GetSmbiosStructureSize` | KASan heap-OOB |
-| 14| smi         | `HandleSmmCommunicate`        | `MessageLen==0xC0DE`                | stack-OOB write              | KASan stack-OOB    |
-| 15| cpuio       | `HandleCpuIo` (MMIO write)    | `Address==0xDEADBEEFULL`            | MMIOCS constraint violation  | MMIOCS enforce     |
-| 16| acpi        | `HandleAcpiInstallTable`      | `Length==0xDEED`                    | heap-OOB read                | KASan heap-OOB     |
-| 17| crypto      | `HandleHash2Hash`             | `DataLength==0xFADE`                | stack-OOB read               | KASan stack-OOB    |
-| 18| console     | `HandleTextOutOutputString`   | `StringSize==0xFADE`                | heap-use-after-free          | KASan UAF          |
-| 19| devicepath  | `HandleDevicePathFromText`    | `TextSize==0xDEAF`                  | heap-OOB read                | KASan heap-OOB     |
-| 20| file        | `HandleFileRead`              | `Offset==0xDEEDBEEF`                | heap-OOB write (dst)         | KASan heap-OOB     |
+| 9 | pci-io      | `HandlePciIoMemWrite`         | `Count==0x1337` *(pending)*          | shift-out-of-bounds          | UBSan shift        |
+| 10| network     | `HandleIp4Transmit`           | `BufferSize==0xFEED` *(pending)*     | heap-OOB read (hdr parse)    | KASan heap-OOB     |
+| 11| graphics    | `HandleGopBlt`                | `Width==251`                         | mul-overflow Width*Height    | UBSan mul-ov       |
+| 12| hii         | `HandleHiiNewPackageList`     | `PackageSize==509`                   | heap-OOB read past header    | KASan heap-OOB     |
+| 13| smbios      | `HandleSmbiosAdd`             | (unchanged — already TP from §1)     | heap-OOB `GetSmbiosStructureSize` | KASan heap-OOB |
+| 14| smi         | `HandleSmmCommunicate`        | `MessageLen==509`                    | stack-OOB write              | KASan stack-OOB    |
+| 15| cpuio       | `HandleCpuIo` (MMIO write)    | `Address==0xDEADBEEFULL`             | MMIOCS constraint violation  | MMIOCS enforce     |
+| 16| acpi        | `HandleAcpiInstallTable`      | `Length==0xDEED` *(pending)*         | heap-OOB read                | KASan heap-OOB     |
+| 17| crypto      | `HandleHash2Hash`             | `DataLength==0xFADE` (64222)         | stack-OOB read               | KASan stack-OOB    |
+| 18| console     | `HandleTextOutOutputString`   | `StringSize==126`                    | heap-use-after-free          | KASan UAF          |
+| 19| devicepath  | `HandleDevicePathFromText`    | `TextSize==0xDEAF` *(pending)*       | heap-OOB read                | KASan heap-OOB     |
+| 20| file        | `HandleFileRead`              | `Offset==0xDEEDBEEF` *(pending)*     | heap-OOB write (dst)         | KASan heap-OOB     |
+
+**Magic revisions (grammar-bound tripwires)** — rows 11, 12, 14, 18 use
+smaller magics so the grammar's type constraints don't block reachability.
+`gop_blt.width` is bounded `int32[1:256]`, `hii_new_package_list.package_size`
+is a `bytesize[data]` where `data` is `array[int8, 4:512]`,
+`smm_communicate.message_len` is `int32[0:512]`, and `text_out_output_string.string_size`
+is `bytesize[string, int16]` where `string` is `array[int16, 1:64]` (max 128 bytes).
+Within these ranges the magics (251, 509, 509, 126) are unique enough that
+spurious hits are rare but possible; in the INJECT=FALSE production build
+the tripwire code is compiled out entirely, so there are no spurious hits
+where it matters.
 
 ## Implementation shape
 
